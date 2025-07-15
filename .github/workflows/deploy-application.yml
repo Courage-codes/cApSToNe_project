@@ -41,6 +41,7 @@ jobs:
         echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
         echo "SERVICE_NAME=crm-producer-service-dev" >> $GITHUB_ENV
         echo "TASK_FAMILY=crm-producer-task-dev" >> $GITHUB_ENV
+        echo "LOG_GROUP_NAME=/ecs/crm-producer-dev" >> $GITHUB_ENV
     
     - name: Retrieve infrastructure configuration
       run: |
@@ -95,6 +96,21 @@ jobs:
         echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
         
         echo "Built and pushed image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+    
+    - name: Ensure CloudWatch Log Group exists
+      run: |
+        # Create log group if it doesn't exist
+        if ! aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
+          echo "Creating CloudWatch log group: $LOG_GROUP_NAME"
+          aws logs create-log-group --log-group-name "$LOG_GROUP_NAME"
+          
+          # Set retention policy (optional - 7 days)
+          aws logs put-retention-policy \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --retention-in-days 7
+        else
+          echo "Log group $LOG_GROUP_NAME already exists"
+        fi
     
     - name: Update task definition
       run: |
@@ -264,29 +280,35 @@ jobs:
           echo "No stopped tasks found"
         fi
         
-        # Check CloudWatch logs for container errors
+        # Check CloudWatch logs for container errors (with better error handling)
         echo "=== CHECKING CLOUDWATCH LOGS ==="
-        LOG_GROUP="/ecs/crm-producer-dev"
         
-        # Get the most recent log stream
-        LOG_STREAM=$(aws logs describe-log-streams \
-          --log-group-name "$LOG_GROUP" \
-          --order-by LastEventTime \
-          --descending \
-          --max-items 1 \
-          --query 'logStreams[0].logStreamName' \
-          --output text 2>/dev/null)
-        
-        if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
-          echo "Recent log entries from $LOG_STREAM:"
-          aws logs get-log-events \
-            --log-group-name "$LOG_GROUP" \
-            --log-stream-name "$LOG_STREAM" \
-            --limit 50 \
-            --query 'events[].message' \
-            --output text | tail -20
+        # Check if log group exists first
+        if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
+          echo "Log group $LOG_GROUP_NAME exists"
+          
+          # Get the most recent log stream
+          LOG_STREAM=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --order-by LastEventTime \
+            --descending \
+            --max-items 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text 2>/dev/null)
+          
+          if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
+            echo "Recent log entries from $LOG_STREAM:"
+            aws logs get-log-events \
+              --log-group-name "$LOG_GROUP_NAME" \
+              --log-stream-name "$LOG_STREAM" \
+              --limit 50 \
+              --query 'events[].message' \
+              --output text | tail -20
+          else
+            echo "No log streams found in log group: $LOG_GROUP_NAME"
+          fi
         else
-          echo "No logs available in log group: $LOG_GROUP"
+          echo "Log group $LOG_GROUP_NAME does not exist"
         fi
         
         # Check task definition for common issues
@@ -325,31 +347,78 @@ jobs:
         echo "Service Status:"
         echo "$SERVICE_STATUS"
         
-        # Get recent log entries
-        echo "Recent log entries:"
-        LOG_STREAM=$(aws logs describe-log-streams \
-          --log-group-name /ecs/crm-producer-dev \
-          --order-by LastEventTime \
-          --descending \
-          --max-items 1 \
-          --query 'logStreams[0].logStreamName' \
-          --output text 2>/dev/null)
+        # Check if service is running properly
+        RUNNING_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.Running')
+        DESIRED_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.Desired')
         
-        if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
-          aws logs get-log-events \
-            --log-group-name /ecs/crm-producer-dev \
-            --log-stream-name "$LOG_STREAM" \
-            --limit 10 \
-            --query 'events[].message' \
-            --output text
+        if [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" -gt 0 ]; then
+          echo "✅ Service is running successfully ($RUNNING_COUNT/$DESIRED_COUNT tasks)"
         else
-          echo "No logs available yet"
+          echo "❌ Service is not running properly ($RUNNING_COUNT/$DESIRED_COUNT tasks)"
+          exit 1
         fi
+        
+        # Get recent log entries with better error handling
+        echo "Checking for recent log entries..."
+        
+        # Check if log group exists
+        if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
+          echo "Log group exists, checking for log streams..."
+          
+          # Wait a bit for logs to appear
+          sleep 10
+          
+          # Get the most recent log stream
+          LOG_STREAM=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --order-by LastEventTime \
+            --descending \
+            --max-items 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text 2>/dev/null)
+          
+          if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ] && [ "$LOG_STREAM" != "null" ]; then
+            echo "Recent log entries from $LOG_STREAM:"
+            aws logs get-log-events \
+              --log-group-name "$LOG_GROUP_NAME" \
+              --log-stream-name "$LOG_STREAM" \
+              --limit 10 \
+              --query 'events[].message' \
+              --output text
+          else
+            echo "No log streams available yet (this is normal for new deployments)"
+            echo "The application may still be starting up. Check logs later if needed."
+          fi
+        else
+          echo "Log group $LOG_GROUP_NAME does not exist yet"
+          echo "This might indicate an issue with the task definition or container startup"
+        fi
+        
+        # Get currently running tasks
+        echo "Currently running tasks:"
+        aws ecs list-tasks \
+          --cluster $CLUSTER_NAME \
+          --service-name $SERVICE_NAME \
+          --desired-status RUNNING \
+          --query 'taskArns' \
+          --output table
     
     - name: Output deployment summary
       run: |
-        echo "Application deployment completed successfully!"
-        echo "Environment: dev"
-        echo "Image: $IMAGE_URI"
-        echo "Service: $SERVICE_NAME"
-        echo "Cluster: $CLUSTER_NAME"
+        echo "======================================="
+        echo "🎉 DEPLOYMENT SUMMARY"
+        echo "======================================="
+        echo "✅ Application deployment completed successfully!"
+        echo "📍 Environment: $ENVIRONMENT"
+        echo "🐳 Image: $IMAGE_URI"
+        echo "🚀 Service: $SERVICE_NAME"
+        echo "🏢 Cluster: $CLUSTER_NAME"
+        echo "📊 Log Group: $LOG_GROUP_NAME"
+        echo "======================================="
+        
+        # Final service status check
+        aws ecs describe-services \
+          --cluster $CLUSTER_NAME \
+          --services $SERVICE_NAME \
+          --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount,TaskDefinition:taskDefinition}' \
+          --output table
