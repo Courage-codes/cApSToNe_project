@@ -14,11 +14,5 @@
     "Enabled": true,
     "LogGroupName": "/aws/kinesisfirehose/crm-interactions-ENVIRONMENT_PLACEHOLDER"
   },
-  "ProcessingConfiguration": {
-    "Enabled": false
-  },
-  "RoleARN": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/firehose-delivery-role-ENVIRONMENT_PLACEHOLDER",
-  "DynamicPartitioning": {
-    "Enabled": false
-  }
+  "RoleARN": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/firehose-delivery-role-ENVIRONMENT_PLACEHOLDER"
 }
