@@ -1,8 +1,8 @@
 {
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
+  "cpu": "512",
+  "memory": "1024",
   "executionRoleArn": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/ecsTaskExecutionRole-ENVIRONMENT_PLACEHOLDER",
   "taskRoleArn": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/ecsTaskRole-ENVIRONMENT_PLACEHOLDER",
   "containerDefinitions": [
@@ -51,19 +51,22 @@
         "options": {
           "awslogs-group": "/ecs/crm-producer-ENVIRONMENT_PLACEHOLDER",
           "awslogs-region": "AWS_REGION_PLACEHOLDER",
-          "awslogs-stream-prefix": "ecs"
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
         }
       },
       "healthCheck": {
         "command": [
           "CMD-SHELL",
-          "curl -f http://localhost:8080/health || exit 1"
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"
         ],
         "interval": 30,
-        "timeout": 5,
+        "timeout": 10,
         "retries": 3,
-        "startPeriod": 60
-      }
+        "startPeriod": 90
+      },
+      "stopTimeout": 30,
+      "startTimeout": 180
     }
   ]
 }
