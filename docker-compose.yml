@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  crm:
+    build: ./crm
+    environment:
+      - API_URL=http://3.248.199.26:8000/api/customer-interaction/
+      - STREAM_NAME=local-crm-stream
+      - POLL_INTERVAL=30
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    environment:
+      - API_URL=http://3.248.199.26:8000/api/web-traffic/
+      - STREAM_NAME=local-web-stream
+      - POLL_INTERVAL=30
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
