@@ -151,8 +151,8 @@ jobs:
         aws ecs wait services-stable \
           --cluster $CLUSTER_NAME \
           --services $SERVICE_NAME \
-          --max-attempts 20 \
-          --delay 30
+          --cli-read-timeout 600 \
+          --cli-connect-timeout 60
         
         echo "Service deployment completed successfully"
     
