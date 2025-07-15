@@ -3,6 +3,7 @@ set -euo pipefail
 
 ENVIRONMENT=${1:-dev}
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION=${AWS_REGION:-eu-west-1}
 
 log_info() {
     echo "$(date '+%H:%M:%S') [INFO] $1"
@@ -19,8 +20,19 @@ create_s3_bucket() {
     if resource_exists "aws s3api head-bucket --bucket $bucket_name"; then
         log_info "S3 bucket exists: $bucket_name"
     else
-        log_info "Creating S3 bucket: $bucket_name"
-        aws s3api create-bucket --bucket "$bucket_name" --region eu-west-1
+        log_info "Creating S3 bucket: $bucket_name in region: $REGION"
+        if [[ "$REGION" == "us-east-1" ]]; then
+            # us-east-1 doesn't need LocationConstraint
+            aws s3api create-bucket --bucket "$bucket_name" --region "$REGION"
+        else
+            # All other regions need LocationConstraint
+            aws s3api create-bucket \
+                --bucket "$bucket_name" \
+                --region "$REGION" \
+                --create-bucket-configuration LocationConstraint="$REGION"
+        fi
+        
+        log_info "Configuring bucket versioning and lifecycle"
         aws s3api put-bucket-versioning --bucket "$bucket_name" --versioning-configuration Status=Enabled
         aws s3api put-bucket-lifecycle-configuration --bucket "$bucket_name" --lifecycle-configuration '{
             "Rules": [{
