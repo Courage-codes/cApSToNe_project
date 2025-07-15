@@ -22,10 +22,8 @@ create_s3_bucket() {
     else
         log_info "Creating S3 bucket: $bucket_name in region: $REGION"
         if [[ "$REGION" == "us-east-1" ]]; then
-            # us-east-1 doesn't need LocationConstraint
             aws s3api create-bucket --bucket "$bucket_name" --region "$REGION"
         else
-            # All other regions need LocationConstraint
             aws s3api create-bucket \
                 --bucket "$bucket_name" \
                 --region "$REGION" \
@@ -34,10 +32,13 @@ create_s3_bucket() {
         
         log_info "Configuring bucket versioning and lifecycle"
         aws s3api put-bucket-versioning --bucket "$bucket_name" --versioning-configuration Status=Enabled
+        
+        # Fixed lifecycle configuration with required Filter field
         aws s3api put-bucket-lifecycle-configuration --bucket "$bucket_name" --lifecycle-configuration '{
             "Rules": [{
                 "ID": "DeleteOldData",
                 "Status": "Enabled",
+                "Filter": {"Prefix": ""},
                 "Expiration": {"Days": 90}
             }]
         }'
@@ -75,7 +76,7 @@ create_iam_roles() {
         aws iam attach-role-policy --role-name "ecs-task-role-$ENVIRONMENT" --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
     fi
     
-    # Firehose Role
+    # Firehose Role with fixed variable interpolation
     if ! resource_exists "aws iam get-role --role-name firehose-role-$ENVIRONMENT"; then
         log_info "Creating Firehose role"
         aws iam create-role --role-name "firehose-role-$ENVIRONMENT" --assume-role-policy-document '{
@@ -86,24 +87,30 @@ create_iam_roles() {
                 "Action": "sts:AssumeRole"
             }]
         }'
-        aws iam put-role-policy --role-name "firehose-role-$ENVIRONMENT" --policy-name S3DeliveryPolicy --policy-document '{
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "s3:AbortMultipartUpload",
-                    "s3:GetBucketLocation",
-                    "s3:GetObject",
-                    "s3:ListBucket",
-                    "s3:ListBucketMultipartUploads",
-                    "s3:PutObject"
-                ],
-                "Resource": [
-                    "arn:aws:s3:::data-pipeline-'$ENVIRONMENT'-'$ACCOUNT_ID'",
-                    "arn:aws:s3:::data-pipeline-'$ENVIRONMENT'-'$ACCOUNT_ID'/*"
-                ]
-            }]
-        }'
+        
+        # Create policy document with proper variable substitution
+        cat > /tmp/firehose-policy.json << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": [
+            "s3:AbortMultipartUpload",
+            "s3:GetBucketLocation",
+            "s3:GetObject",
+            "s3:ListBucket",
+            "s3:ListBucketMultipartUploads",
+            "s3:PutObject"
+        ],
+        "Resource": [
+            "arn:aws:s3:::data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}",
+            "arn:aws:s3:::data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}/*"
+        ]
+    }]
+}
+EOF
+        
+        aws iam put-role-policy --role-name "firehose-role-$ENVIRONMENT" --policy-name S3DeliveryPolicy --policy-document file:///tmp/firehose-policy.json
     fi
 }
 
@@ -113,32 +120,48 @@ create_firehose_streams() {
     # CRM Stream
     if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name crm-stream-$ENVIRONMENT"; then
         log_info "Creating CRM Firehose stream"
+        
+        # Create configuration file to avoid JSON escaping issues
+        cat > /tmp/crm-firehose-config.json << EOF
+{
+    "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
+    "BucketARN": "arn:aws:s3:::${bucket_name}",
+    "Prefix": "crm/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
+    "CompressionFormat": "GZIP"
+}
+EOF
+        
         aws firehose create-delivery-stream \
             --delivery-stream-name "crm-stream-$ENVIRONMENT" \
             --delivery-stream-type DirectPut \
-            --s3-destination-configuration '{
-                "RoleARN": "arn:aws:iam::'$ACCOUNT_ID':role/firehose-role-'$ENVIRONMENT'",
-                "BucketARN": "arn:aws:s3:::'$bucket_name'",
-                "Prefix": "crm/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
-                "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
-                "CompressionFormat": "GZIP"
-            }'
+            --s3-destination-configuration file:///tmp/crm-firehose-config.json
     fi
     
     # Web Stream
     if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name web-stream-$ENVIRONMENT"; then
         log_info "Creating Web Firehose stream"
+        
+        # Create configuration file to avoid JSON escaping issues
+        cat > /tmp/web-firehose-config.json << EOF
+{
+    "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
+    "BucketARN": "arn:aws:s3:::${bucket_name}",
+    "Prefix": "web/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
+    "CompressionFormat": "GZIP"
+}
+EOF
+        
         aws firehose create-delivery-stream \
             --delivery-stream-name "web-stream-$ENVIRONMENT" \
             --delivery-stream-type DirectPut \
-            --s3-destination-configuration '{
-                "RoleARN": "arn:aws:iam::'$ACCOUNT_ID':role/firehose-role-'$ENVIRONMENT'",
-                "BucketARN": "arn:aws:s3:::'$bucket_name'",
-                "Prefix": "web/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
-                "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
-                "CompressionFormat": "GZIP"
-            }'
+            --s3-destination-configuration file:///tmp/web-firehose-config.json
     fi
+    
+    # Store stream names in Parameter Store
+    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/crm-stream-name" --value "crm-stream-$ENVIRONMENT" --type String --overwrite
+    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/web-stream-name" --value "web-stream-$ENVIRONMENT" --type String --overwrite
 }
 
 create_ecs_cluster() {
