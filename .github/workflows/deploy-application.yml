@@ -45,7 +45,6 @@ jobs:
     
     - name: Retrieve infrastructure configuration
       run: |
-        # Get configuration from Parameter Store
         BUCKET_NAME=$(aws ssm get-parameter \
           --name "/crm-pipeline/dev/bucket-name" \
           --query 'Parameter.Value' \
@@ -70,8 +69,6 @@ jobs:
         echo "FIREHOSE_STREAM=$FIREHOSE_STREAM" >> $GITHUB_ENV
         echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
         echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID" >> $GITHUB_ENV
-        
-        echo "Retrieved configuration for environment: dev"
     
     - name: Login to Amazon ECR
       id: login-ecr
@@ -81,67 +78,49 @@ jobs:
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
       run: |
-        # Create ECR repository if it doesn't exist
         aws ecr describe-repositories --repository-names $ECR_REPOSITORY || \
         aws ecr create-repository --repository-name $ECR_REPOSITORY
         
-        # Build and push Docker image
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG src/fargate-producer/
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         
-        # Tag as latest for the environment
         docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:dev-latest
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:dev-latest
         
         echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
-        
-        echo "Built and pushed image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
     
     - name: Ensure CloudWatch Log Group exists
       run: |
-        # Create log group if it doesn't exist
         if ! aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
-          echo "Creating CloudWatch log group: $LOG_GROUP_NAME"
           aws logs create-log-group --log-group-name "$LOG_GROUP_NAME"
-          
-          # Set retention policy (optional - 7 days)
           aws logs put-retention-policy \
             --log-group-name "$LOG_GROUP_NAME" \
             --retention-in-days 7
-        else
-          echo "Log group $LOG_GROUP_NAME already exists"
         fi
     
     - name: Update task definition
       run: |
-        # Update task definition template using alternative delimiters to avoid conflicts with URLs
         sed "s|ACCOUNT_ID_PLACEHOLDER|${{ secrets.AWS_ACCOUNT_ID }}|g" config/task-definition.json > /tmp/task-definition.json
         sed -i "s|ENVIRONMENT_PLACEHOLDER|dev|g" /tmp/task-definition.json
         sed -i "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" /tmp/task-definition.json
         sed -i "s|FIREHOSE_STREAM_PLACEHOLDER|$FIREHOSE_STREAM|g" /tmp/task-definition.json
         sed -i "s|AWS_REGION_PLACEHOLDER|$AWS_REGION|g" /tmp/task-definition.json
         
-        # Register new task definition
         aws ecs register-task-definition \
           --family $TASK_FAMILY \
           --cli-input-json file:///tmp/task-definition.json
-        
-        echo "Registered new task definition: $TASK_FAMILY"
     
     - name: Deploy to ECS
       run: |
-        # Get default VPC subnets
         VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
         SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0:2].SubnetId' --output text | tr '\t' ',')
         
-        # Check if service exists
         if aws ecs describe-services \
           --cluster $CLUSTER_NAME \
           --services $SERVICE_NAME \
           --query 'services[0].serviceName' \
           --output text 2>/dev/null | grep -q $SERVICE_NAME; then
           
-          # Update existing service
           aws ecs update-service \
             --cluster $CLUSTER_NAME \
             --service $SERVICE_NAME \
@@ -149,7 +128,6 @@ jobs:
           
           echo "Updated existing service: $SERVICE_NAME"
         else
-          # Create new service
           aws ecs create-service \
             --cluster $CLUSTER_NAME \
             --service-name $SERVICE_NAME \
@@ -165,175 +143,23 @@ jobs:
       run: |
         echo "Waiting for service deployment to complete..."
         
-        # Check initial service status
-        echo "Initial service status:"
-        aws ecs describe-services \
-          --cluster $CLUSTER_NAME \
-          --services $SERVICE_NAME \
-          --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount,TaskDefinition:taskDefinition}' \
-          --output table
-        
-        # Use shorter timeout for quicker feedback
-        echo "Waiting for service to stabilize (timeout: 10 minutes)..."
         if ! timeout 600 aws ecs wait services-stable \
           --cluster $CLUSTER_NAME \
           --services $SERVICE_NAME; then
           
-          echo "Service did not stabilize within timeout. Checking current status..."
-          
-          # Get detailed service information
-          echo "=== CURRENT SERVICE STATUS ==="
+          echo "Service did not stabilize within timeout"
           aws ecs describe-services \
             --cluster $CLUSTER_NAME \
             --services $SERVICE_NAME \
-            --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount,Deployments:deployments}' \
-            --output json
-          
-          # Check for stopped tasks - THIS IS THE KEY DIAGNOSTIC STEP
-          echo "=== ANALYZING STOPPED TASKS ==="
-          STOPPED_TASKS=$(aws ecs list-tasks \
-            --cluster $CLUSTER_NAME \
-            --service-name $SERVICE_NAME \
-            --desired-status STOPPED \
-            --query 'taskArns[0:5]' \
-            --output text)
-          
-          if [ -n "$STOPPED_TASKS" ] && [ "$STOPPED_TASKS" != "None" ]; then
-            echo "Found stopped tasks, analyzing reasons..."
-            for task_arn in $STOPPED_TASKS; do
-              if [ -n "$task_arn" ] && [ "$task_arn" != "None" ]; then
-                echo "--- Task: $task_arn ---"
-                aws ecs describe-tasks \
-                  --cluster $CLUSTER_NAME \
-                  --tasks "$task_arn" \
-                  --query 'tasks[0].{TaskArn:taskArn,LastStatus:lastStatus,StoppedReason:stoppedReason,StoppedAt:stoppedAt,Containers:containers[0].{Name:name,LastStatus:lastStatus,Reason:reason,ExitCode:exitCode}}' \
-                  --output json
-                echo ""
-              fi
-            done
-          else
-            echo "No stopped tasks found"
-          fi
-          
-          # Check recent events
-          echo "=== RECENT SERVICE EVENTS ==="
-          aws ecs describe-services \
-            --cluster $CLUSTER_NAME \
-            --services $SERVICE_NAME \
-            --query 'services[0].events[0:10]' \
+            --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount}' \
             --output table
-          
           exit 1
         fi
         
         echo "Service deployment completed successfully"
     
-    - name: Analyze stopped tasks (on failure)
-      if: failure()
-      run: |
-        echo "=== DETAILED FAILURE ANALYSIS ==="
-        
-        # Get all stopped tasks from the last hour
-        echo "Getting stopped tasks from the last hour..."
-        STOPPED_TASKS=$(aws ecs list-tasks \
-          --cluster $CLUSTER_NAME \
-          --service-name $SERVICE_NAME \
-          --desired-status STOPPED \
-          --query 'taskArns' \
-          --output text)
-        
-        if [ -n "$STOPPED_TASKS" ] && [ "$STOPPED_TASKS" != "None" ]; then
-          echo "Analyzing stopped tasks for failure reasons..."
-          
-          for task_arn in $STOPPED_TASKS; do
-            if [ -n "$task_arn" ] && [ "$task_arn" != "None" ]; then
-              echo "================================================"
-              echo "TASK: $task_arn"
-              echo "================================================"
-              
-              # Get detailed task information
-              TASK_INFO=$(aws ecs describe-tasks \
-                --cluster $CLUSTER_NAME \
-                --tasks "$task_arn" \
-                --query 'tasks[0]' \
-                --output json)
-              
-              echo "Task Status:"
-              echo "$TASK_INFO" | jq -r '.lastStatus // "N/A"'
-              
-              echo "Stopped Reason:"
-              echo "$TASK_INFO" | jq -r '.stoppedReason // "N/A"'
-              
-              echo "Stopped At:"
-              echo "$TASK_INFO" | jq -r '.stoppedAt // "N/A"'
-              
-              echo "Container Details:"
-              echo "$TASK_INFO" | jq -r '.containers[] | "Name: \(.name), Status: \(.lastStatus // "N/A"), Reason: \(.reason // "N/A"), ExitCode: \(.exitCode // "N/A")"'
-              
-              echo "Task Definition ARN:"
-              echo "$TASK_INFO" | jq -r '.taskDefinitionArn // "N/A"'
-              
-              echo ""
-            fi
-          done
-        else
-          echo "No stopped tasks found"
-        fi
-        
-        # Check CloudWatch logs for container errors (with better error handling)
-        echo "=== CHECKING CLOUDWATCH LOGS ==="
-        
-        # Check if log group exists first
-        if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
-          echo "Log group $LOG_GROUP_NAME exists"
-          
-          # Get recent log events from all streams
-          echo "Checking recent log events from all streams..."
-          RECENT_EVENTS=$(aws logs filter-log-events \
-            --log-group-name "$LOG_GROUP_NAME" \
-            --start-time $(date -d '30 minutes ago' +%s)000 \
-            --limit 50 \
-            --query 'events[].message' \
-            --output text 2>/dev/null)
-          
-          if [ -n "$RECENT_EVENTS" ] && [ "$RECENT_EVENTS" != "None" ]; then
-            echo "Recent log entries:"
-            echo "$RECENT_EVENTS" | tail -20
-          else
-            echo "No recent log entries found"
-          fi
-        else
-          echo "Log group $LOG_GROUP_NAME does not exist"
-        fi
-        
-        # Check task definition for common issues
-        echo "=== TASK DEFINITION ANALYSIS ==="
-        aws ecs describe-task-definition \
-          --task-definition $TASK_FAMILY \
-          --query 'taskDefinition.{Family:family,Revision:revision,Cpu:cpu,Memory:memory,NetworkMode:networkMode,ExecutionRole:executionRoleArn,TaskRole:taskRoleArn,ContainerDefinitions:containerDefinitions[0].{Name:name,Image:image,Memory:memory,Cpu:cpu,Essential:essential,LogConfiguration:logConfiguration}}' \
-          --output json
-        
-        # Check subnet and security group
-        echo "=== NETWORK CONFIGURATION ==="
-        VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
-        echo "VPC ID: $VPC_ID"
-        
-        echo "Security Group details:"
-        aws ec2 describe-security-groups \
-          --group-ids $SECURITY_GROUP_ID \
-          --query 'SecurityGroups[0].{GroupId:GroupId,GroupName:GroupName,VpcId:VpcId,InboundRules:IpPermissions,OutboundRules:IpPermissionsEgress}' \
-          --output json
-        
-        # Check if subnets have available IP addresses
-        echo "Subnet IP availability:"
-        aws ec2 describe-subnets \
-          --filters "Name=vpc-id,Values=$VPC_ID" \
-          --query 'Subnets[0:2].{SubnetId:SubnetId,AvailabilityZone:AvailabilityZone,AvailableIpAddressCount:AvailableIpAddressCount,State:State}' \
-          --output table
-    
     - name: Verify deployment
       run: |
-        # Check service status
         SERVICE_STATUS=$(aws ecs describe-services \
           --cluster $CLUSTER_NAME \
           --services $SERVICE_NAME \
@@ -342,7 +168,6 @@ jobs:
         echo "Service Status:"
         echo "$SERVICE_STATUS"
         
-        # Check if service is running properly
         RUNNING_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.Running')
         DESIRED_COUNT=$(echo "$SERVICE_STATUS" | jq -r '.Desired')
         
@@ -353,54 +178,12 @@ jobs:
           exit 1
         fi
         
-        # Get recent log entries with improved error handling
-        echo "Checking for recent log entries..."
-        
-        # Check if log group exists
-        if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
-          echo "Log group exists, checking for recent events..."
-          
-          # Wait a bit for logs to appear
-          sleep 10
-          
-          # Get recent log events from all streams using filter-log-events
-          RECENT_EVENTS=$(aws logs filter-log-events \
-            --log-group-name "$LOG_GROUP_NAME" \
-            --start-time $(date -d '10 minutes ago' +%s)000 \
-            --limit 10 \
-            --query 'events[].message' \
-            --output text 2>/dev/null)
-          
-          if [ -n "$RECENT_EVENTS" ] && [ "$RECENT_EVENTS" != "None" ]; then
-            echo "Recent log entries:"
-            echo "$RECENT_EVENTS"
-          else
-            echo "No recent log entries found (this is normal for new deployments)"
-            echo "The application may still be starting up. Check logs later if needed."
-            
-            # List available log streams for debugging
-            echo "Available log streams:"
-            aws logs describe-log-streams \
-              --log-group-name "$LOG_GROUP_NAME" \
-              --order-by LastEventTime \
-              --descending \
-              --max-items 5 \
-              --query 'logStreams[].{StreamName:logStreamName,LastEventTime:lastEventTime}' \
-              --output table 2>/dev/null || echo "No log streams found"
-          fi
+        # Simple log check
+        if aws logs describe-log-groups --log-group-name "$LOG_GROUP_NAME" >/dev/null 2>&1; then
+          echo "✅ Application logs are accessible"
         else
-          echo "Log group $LOG_GROUP_NAME does not exist yet"
-          echo "This might indicate an issue with the task definition or container startup"
+          echo "⚠️  Log group not found, but service is running"
         fi
-        
-        # Get currently running tasks
-        echo "Currently running tasks:"
-        aws ecs list-tasks \
-          --cluster $CLUSTER_NAME \
-          --service-name $SERVICE_NAME \
-          --desired-status RUNNING \
-          --query 'taskArns' \
-          --output table
     
     - name: Output deployment summary
       run: |
@@ -414,10 +197,3 @@ jobs:
         echo "🏢 Cluster: $CLUSTER_NAME"
         echo "📊 Log Group: $LOG_GROUP_NAME"
         echo "======================================="
-        
-        # Final service status check
-        aws ecs describe-services \
-          --cluster $CLUSTER_NAME \
-          --services $SERVICE_NAME \
-          --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount,TaskDefinition:taskDefinition}' \
-          --output table

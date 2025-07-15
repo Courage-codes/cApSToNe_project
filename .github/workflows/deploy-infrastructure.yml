@@ -33,13 +33,6 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
     
-    - name: Set environment variables
-      run: |
-        echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-        echo "BUCKET_NAME=crm-interactions-raw-dev" >> $GITHUB_ENV
-        echo "STREAM_NAME=crm-interactions-stream-dev" >> $GITHUB_ENV
-        echo "CLUSTER_NAME=crm-producer-cluster-dev" >> $GITHUB_ENV
-    
     - name: Create S3 Bucket
       id: create-s3
       run: |
@@ -69,7 +62,6 @@ jobs:
         
         echo "bucket-name=crm-interactions-raw-dev" >> $GITHUB_OUTPUT
         
-        # Store in Parameter Store for other workflows
         aws ssm put-parameter \
           --name "/crm-pipeline/dev/bucket-name" \
           --value "crm-interactions-raw-dev" \
@@ -159,19 +151,29 @@ jobs:
         # Wait for IAM roles to be ready
         sleep 30
     
-    - name: Create CloudWatch Log Groups
+    - name: Create CloudWatch Log Groups (FIXED)
       run: |
-        # Create log group for ECS tasks
-        aws logs create-log-group \
-          --log-group-name /ecs/crm-producer-dev \
-          --retention-in-days 30 || true
+        # Create log group for ECS tasks with correct syntax
+        if ! aws logs describe-log-groups --log-group-name-prefix /ecs/crm-producer-dev --query 'logGroups[?logGroupName==`/ecs/crm-producer-dev`]' --output text | grep -q "/ecs/crm-producer-dev"; then
+          aws logs create-log-group --log-group-name /ecs/crm-producer-dev
+          aws logs put-retention-policy \
+            --log-group-name /ecs/crm-producer-dev \
+            --retention-in-days 30
+          echo "Created ECS log group: /ecs/crm-producer-dev"
+        else
+          echo "ECS log group already exists: /ecs/crm-producer-dev"
+        fi
         
-        # Create log group for Firehose
-        aws logs create-log-group \
-          --log-group-name /aws/kinesisfirehose/crm-interactions-dev \
-          --retention-in-days 30 || true
-        
-        echo "CloudWatch log groups ready"
+        # Create log group for Firehose with correct syntax
+        if ! aws logs describe-log-groups --log-group-name-prefix /aws/kinesisfirehose/crm-interactions-dev --query 'logGroups[?logGroupName==`/aws/kinesisfirehose/crm-interactions-dev`]' --output text | grep -q "/aws/kinesisfirehose/crm-interactions-dev"; then
+          aws logs create-log-group --log-group-name /aws/kinesisfirehose/crm-interactions-dev
+          aws logs put-retention-policy \
+            --log-group-name /aws/kinesisfirehose/crm-interactions-dev \
+            --retention-in-days 30
+          echo "Created Firehose log group: /aws/kinesisfirehose/crm-interactions-dev"
+        else
+          echo "Firehose log group already exists: /aws/kinesisfirehose/crm-interactions-dev"
+        fi
     
     - name: Create Kinesis Firehose Stream
       id: create-firehose
@@ -179,7 +181,6 @@ jobs:
         if aws firehose describe-delivery-stream --delivery-stream-name crm-interactions-stream-dev 2>/dev/null; then
           echo "Firehose stream already exists: crm-interactions-stream-dev"
         else
-          # Update firehose config with current bucket
           sed "s/BUCKET_NAME_PLACEHOLDER/crm-interactions-raw-dev/g" config/firehose-config.json > /tmp/firehose-config.json
           sed -i "s/ACCOUNT_ID_PLACEHOLDER/${{ secrets.AWS_ACCOUNT_ID }}/g" /tmp/firehose-config.json
           sed -i "s/ENVIRONMENT_PLACEHOLDER/dev/g" /tmp/firehose-config.json
@@ -194,7 +195,6 @@ jobs:
         
         echo "stream-name=crm-interactions-stream-dev" >> $GITHUB_OUTPUT
         
-        # Store in Parameter Store
         aws ssm put-parameter \
           --name "/crm-pipeline/dev/firehose-stream" \
           --value "crm-interactions-stream-dev" \
@@ -217,7 +217,6 @@ jobs:
         
         echo "cluster-name=crm-producer-cluster-dev" >> $GITHUB_OUTPUT
         
-        # Store in Parameter Store
         aws ssm put-parameter \
           --name "/crm-pipeline/dev/cluster-name" \
           --value "crm-producer-cluster-dev" \
@@ -226,10 +225,8 @@ jobs:
     
     - name: Create Security Group
       run: |
-        # Get default VPC
         VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
         
-        # Create security group
         SG_ID=$(aws ec2 create-security-group \
           --group-name crm-producer-sg-dev \
           --description "Security group for CRM producer" \
@@ -239,21 +236,18 @@ jobs:
             --filters "Name=group-name,Values=crm-producer-sg-dev" \
             --query 'SecurityGroups[0].GroupId' --output text)
         
-        # Allow outbound HTTPS traffic
         aws ec2 authorize-security-group-egress \
           --group-id $SG_ID \
           --protocol tcp \
           --port 443 \
           --cidr 0.0.0.0/0 2>/dev/null || true
         
-        # Allow outbound HTTP traffic
         aws ec2 authorize-security-group-egress \
           --group-id $SG_ID \
           --protocol tcp \
           --port 80 \
           --cidr 0.0.0.0/0 2>/dev/null || true
         
-        # Store security group ID
         aws ssm put-parameter \
           --name "/crm-pipeline/dev/security-group-id" \
           --value "$SG_ID" \
@@ -264,7 +258,8 @@ jobs:
     
     - name: Output Summary
       run: |
-        echo "Infrastructure deployment completed for environment: dev"
-        echo "S3 Bucket: crm-interactions-raw-dev"
-        echo "Firehose Stream: crm-interactions-stream-dev"
-        echo "ECS Cluster: crm-producer-cluster-dev"
+        echo "✅ Infrastructure deployment completed for environment: dev"
+        echo "📦 S3 Bucket: crm-interactions-raw-dev"
+        echo "🚀 Firehose Stream: crm-interactions-stream-dev"
+        echo "🏢 ECS Cluster: crm-producer-cluster-dev"
+        echo "📊 CloudWatch Log Groups: /ecs/crm-producer-dev, /aws/kinesisfirehose/crm-interactions-dev"

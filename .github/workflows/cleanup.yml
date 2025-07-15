@@ -26,14 +26,16 @@ jobs:
     - name: Validate deletion confirmation
       run: |
         if [ "${{ inputs.confirm_deletion }}" != "DELETE" ]; then
-          echo "Deletion not confirmed. Please type 'DELETE' to confirm."
+          echo "❌ Deletion not confirmed. Please type 'DELETE' to confirm."
           exit 1
         fi
         
         if [ "$ENVIRONMENT" = "prod" ]; then
-          echo "Production environment cleanup is not allowed through this workflow."
+          echo "❌ Production environment cleanup is not allowed through this workflow."
           exit 1
         fi
+        
+        echo "✅ Deletion confirmed for environment: $ENVIRONMENT"
     
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -52,170 +54,293 @@ jobs:
     
     - name: Stop and delete ECS service
       run: |
-        # Scale service to 0
+        echo "🔍 Checking for ECS service: $SERVICE_NAME"
+        
         if aws ecs describe-services \
           --cluster $CLUSTER_NAME \
           --services $SERVICE_NAME \
           --query 'services[0].serviceName' \
           --output text 2>/dev/null | grep -q $SERVICE_NAME; then
           
+          echo "📉 Scaling service to 0 tasks..."
           aws ecs update-service \
             --cluster $CLUSTER_NAME \
             --service $SERVICE_NAME \
             --desired-count 0
           
-          echo "Waiting for service to scale down..."
+          echo "⏳ Waiting for service to scale down..."
           aws ecs wait services-stable \
             --cluster $CLUSTER_NAME \
             --services $SERVICE_NAME
           
-          # Delete service
+          echo "🗑️ Deleting ECS service..."
           aws ecs delete-service \
             --cluster $CLUSTER_NAME \
             --service $SERVICE_NAME
           
-          echo "Deleted ECS service: $SERVICE_NAME"
+          echo "✅ Deleted ECS service: $SERVICE_NAME"
+          
+          # Critical: Wait for network interfaces to begin cleanup
+          echo "⏳ Waiting for network interface cleanup to begin..."
+          sleep 90
         else
-          echo "ECS service not found: $SERVICE_NAME"
+          echo "ℹ️ ECS service not found: $SERVICE_NAME"
         fi
     
-    - name: Delete ECS cluster
+    - name: Wait for network interface cleanup
       run: |
-        if aws ecs describe-clusters \
-          --clusters $CLUSTER_NAME \
-          --query 'clusters[0].clusterName' \
-          --output text 2>/dev/null | grep -q $CLUSTER_NAME; then
-          
-          aws ecs delete-cluster --cluster $CLUSTER_NAME
-          echo "Deleted ECS cluster: $CLUSTER_NAME"
-        else
-          echo "ECS cluster not found: $CLUSTER_NAME"
-        fi
-    
-    - name: Delete Kinesis Firehose stream
-      run: |
-        if aws firehose describe-delivery-stream \
-          --delivery-stream-name $STREAM_NAME 2>/dev/null; then
-          
-          aws firehose delete-delivery-stream \
-            --delivery-stream-name $STREAM_NAME
-          
-          echo "Deleted Firehose stream: $STREAM_NAME"
-        else
-          echo "Firehose stream not found: $STREAM_NAME"
-        fi
-    
-    - name: Delete IAM roles
-      run: |
-        # Delete Firehose delivery role
-        if aws iam get-role --role-name firehose-delivery-role-dev 2>/dev/null; then
-          aws iam delete-role-policy \
-            --role-name firehose-delivery-role-dev \
-            --policy-name S3DeliveryPolicy || true
-          
-          aws iam delete-role \
-            --role-name firehose-delivery-role-dev
-          
-          echo "Deleted Firehose delivery role"
-        fi
+        echo "🔍 Waiting for network interfaces to fully detach..."
         
-        # Delete ECS task execution role
-        if aws iam get-role --role-name ecsTaskExecutionRole-dev 2>/dev/null; then
-          aws iam detach-role-policy \
-            --role-name ecsTaskExecutionRole-dev \
-            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
-          
-          aws iam delete-role \
-            --role-name ecsTaskExecutionRole-dev
-          
-          echo "Deleted ECS task execution role"
-        fi
-        
-        # Delete ECS task role
-        if aws iam get-role --role-name ecsTaskRole-dev 2>/dev/null; then
-          aws iam detach-role-policy \
-            --role-name ecsTaskRole-dev \
-            --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess || true
-          
-          aws iam delete-role \
-            --role-name ecsTaskRole-dev
-          
-          echo "Deleted ECS task role"
-        fi
-    
-    - name: Delete security group
-      run: |
+        # Get security group ID for checking dependencies
         SG_ID=$(aws ec2 describe-security-groups \
           --filters "Name=group-name,Values=crm-producer-sg-dev" \
           --query 'SecurityGroups[0].GroupId' \
           --output text 2>/dev/null)
         
         if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
-          aws ec2 delete-security-group --group-id $SG_ID
-          echo "Deleted security group: $SG_ID"
+          echo "🔍 Checking for network interfaces attached to security group: $SG_ID"
+          
+          # Wait up to 5 minutes for network interfaces to detach
+          for i in {1..10}; do
+            INTERFACES=$(aws ec2 describe-network-interfaces \
+              --filters "Name=group-id,Values=$SG_ID" \
+              --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+              --output text 2>/dev/null)
+            
+            if [ -z "$INTERFACES" ] || [ "$INTERFACES" = "None" ]; then
+              echo "✅ All network interfaces have detached"
+              break
+            else
+              echo "⏳ Network interfaces still attached (attempt $i/10), waiting 30 seconds..."
+              sleep 30
+            fi
+          done
+        fi
+        
+        # Additional buffer time for AWS internal cleanup
+        echo "⏳ Additional wait for AWS internal cleanup..."
+        sleep 60
+    
+    - name: Delete ECS cluster
+      run: |
+        echo "🔍 Checking for ECS cluster: $CLUSTER_NAME"
+        
+        if aws ecs describe-clusters \
+          --clusters $CLUSTER_NAME \
+          --query 'clusters[0].clusterName' \
+          --output text 2>/dev/null | grep -q $CLUSTER_NAME; then
+          
+          aws ecs delete-cluster --cluster $CLUSTER_NAME
+          echo "✅ Deleted ECS cluster: $CLUSTER_NAME"
         else
-          echo "Security group not found"
+          echo "ℹ️ ECS cluster not found: $CLUSTER_NAME"
         fi
     
-    - name: Delete CloudWatch log group
+    - name: Delete Kinesis Firehose stream
       run: |
-        aws logs delete-log-group \
-          --log-group-name /ecs/crm-producer-dev || true
+        echo "🔍 Checking for Firehose stream: $STREAM_NAME"
         
-        echo "Deleted CloudWatch log group"
+        if aws firehose describe-delivery-stream \
+          --delivery-stream-name $STREAM_NAME 2>/dev/null; then
+          
+          aws firehose delete-delivery-stream \
+            --delivery-stream-name $STREAM_NAME
+          
+          echo "✅ Deleted Firehose stream: $STREAM_NAME"
+        else
+          echo "ℹ️ Firehose stream not found: $STREAM_NAME"
+        fi
+    
+    - name: Delete security group with retry logic
+      run: |
+        echo "🔍 Attempting to delete security group..."
+        
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=crm-producer-sg-dev" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null)
+        
+        if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+          echo "🎯 Found security group: $SG_ID"
+          
+          # Retry logic for security group deletion
+          for attempt in {1..5}; do
+            echo "🔄 Attempt $attempt to delete security group: $SG_ID"
+            
+            # Check for remaining dependencies before each attempt
+            INTERFACES=$(aws ec2 describe-network-interfaces \
+              --filters "Name=group-id,Values=$SG_ID" \
+              --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+              --output text 2>/dev/null)
+            
+            if [ -n "$INTERFACES" ] && [ "$INTERFACES" != "None" ]; then
+              echo "⚠️ Network interfaces still attached: $INTERFACES"
+              echo "⏳ Waiting additional 60 seconds for cleanup..."
+              sleep 60
+              continue
+            fi
+            
+            # Attempt deletion
+            if aws ec2 delete-security-group --group-id $SG_ID 2>/dev/null; then
+              echo "✅ Security group deleted successfully: $SG_ID"
+              break
+            else
+              if [ $attempt -eq 5 ]; then
+                echo "❌ Failed to delete security group after 5 attempts"
+                echo "🔍 Final dependency check:"
+                aws ec2 describe-network-interfaces \
+                  --filters "Name=group-id,Values=$SG_ID" \
+                  --query 'NetworkInterfaces[*].{NetworkInterfaceId:NetworkInterfaceId,Status:Status,Description:Description}' \
+                  --output table || echo "No network interfaces found"
+                exit 1
+              else
+                echo "❌ Deletion failed, waiting 60 seconds before retry..."
+                sleep 60
+              fi
+            fi
+          done
+        else
+          echo "ℹ️ Security group not found or already deleted"
+        fi
+    
+    - name: Delete IAM roles
+      run: |
+        echo "🔍 Cleaning up IAM roles..."
+        
+        # Delete Firehose delivery role
+        if aws iam get-role --role-name firehose-delivery-role-dev 2>/dev/null; then
+          aws iam delete-role-policy \
+            --role-name firehose-delivery-role-dev \
+            --policy-name S3DeliveryPolicy 2>/dev/null || true
+          
+          aws iam delete-role \
+            --role-name firehose-delivery-role-dev
+          
+          echo "✅ Deleted Firehose delivery role"
+        else
+          echo "ℹ️ Firehose delivery role not found"
+        fi
+        
+        # Delete ECS task execution role
+        if aws iam get-role --role-name ecsTaskExecutionRole-dev 2>/dev/null; then
+          aws iam detach-role-policy \
+            --role-name ecsTaskExecutionRole-dev \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy 2>/dev/null || true
+          
+          aws iam delete-role \
+            --role-name ecsTaskExecutionRole-dev
+          
+          echo "✅ Deleted ECS task execution role"
+        else
+          echo "ℹ️ ECS task execution role not found"
+        fi
+        
+        # Delete ECS task role
+        if aws iam get-role --role-name ecsTaskRole-dev 2>/dev/null; then
+          aws iam detach-role-policy \
+            --role-name ecsTaskRole-dev \
+            --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess 2>/dev/null || true
+          
+          aws iam delete-role \
+            --role-name ecsTaskRole-dev
+          
+          echo "✅ Deleted ECS task role"
+        else
+          echo "ℹ️ ECS task role not found"
+        fi
+    
+    - name: Delete CloudWatch log groups
+      run: |
+        echo "🔍 Cleaning up CloudWatch log groups..."
+        
+        # Delete ECS log group
+        if aws logs describe-log-groups --log-group-name-prefix /ecs/crm-producer-dev --query 'logGroups[0]' --output text 2>/dev/null | grep -q "/ecs/crm-producer-dev"; then
+          aws logs delete-log-group --log-group-name /ecs/crm-producer-dev
+          echo "✅ Deleted ECS CloudWatch log group"
+        else
+          echo "ℹ️ ECS CloudWatch log group not found"
+        fi
+        
+        # Delete Firehose log group
+        if aws logs describe-log-groups --log-group-name-prefix /aws/kinesisfirehose/crm-interactions-dev --query 'logGroups[0]' --output text 2>/dev/null | grep -q "/aws/kinesisfirehose/crm-interactions-dev"; then
+          aws logs delete-log-group --log-group-name /aws/kinesisfirehose/crm-interactions-dev
+          echo "✅ Deleted Firehose CloudWatch log group"
+        else
+          echo "ℹ️ Firehose CloudWatch log group not found"
+        fi
     
     - name: Delete ECR repository
       run: |
-        aws ecr delete-repository \
-          --repository-name crm-producer \
-          --force 2>/dev/null || true
+        echo "🔍 Cleaning up ECR repository..."
         
-        echo "ECR repository cleanup attempted"
+        if aws ecr describe-repositories --repository-names crm-producer 2>/dev/null; then
+          aws ecr delete-repository \
+            --repository-name crm-producer \
+            --force
+          echo "✅ Deleted ECR repository: crm-producer"
+        else
+          echo "ℹ️ ECR repository not found: crm-producer"
+        fi
     
     - name: Handle S3 bucket
       run: |
+        echo "🔍 Handling S3 bucket..."
+        
         if [ "${{ inputs.preserve_s3 }}" = "true" ]; then
-          echo "S3 bucket preserved: crm-interactions-raw-dev"
-          echo "To delete manually later: aws s3 rb s3://crm-interactions-raw-dev --force"
+          echo "💾 S3 bucket preserved: $BUCKET_NAME"
+          echo "ℹ️ To delete manually later: aws s3 rb s3://$BUCKET_NAME --force"
         else
-          if aws s3api head-bucket --bucket crm-interactions-raw-dev 2>/dev/null; then
-            aws s3 rm s3://crm-interactions-raw-dev --recursive
-            aws s3api delete-bucket --bucket crm-interactions-raw-dev
-            echo "Deleted S3 bucket: crm-interactions-raw-dev"
+          if aws s3api head-bucket --bucket $BUCKET_NAME 2>/dev/null; then
+            echo "🗑️ Deleting S3 bucket contents..."
+            aws s3 rm s3://$BUCKET_NAME --recursive
+            
+            echo "🗑️ Deleting S3 bucket..."
+            aws s3api delete-bucket --bucket $BUCKET_NAME
+            
+            echo "✅ Deleted S3 bucket: $BUCKET_NAME"
           else
-            echo "S3 bucket not found: crm-interactions-raw-dev"
+            echo "ℹ️ S3 bucket not found: $BUCKET_NAME"
           fi
         fi
     
     - name: Clean up Parameter Store
       run: |
-        aws ssm delete-parameter \
-          --name "/crm-pipeline/dev/bucket-name" || true
+        echo "🔍 Cleaning up Parameter Store entries..."
         
         aws ssm delete-parameter \
-          --name "/crm-pipeline/dev/firehose-stream" || true
+          --name "/crm-pipeline/dev/bucket-name" 2>/dev/null || true
         
         aws ssm delete-parameter \
-          --name "/crm-pipeline/dev/cluster-name" || true
+          --name "/crm-pipeline/dev/firehose-stream" 2>/dev/null || true
         
         aws ssm delete-parameter \
-          --name "/crm-pipeline/dev/security-group-id" || true
+          --name "/crm-pipeline/dev/cluster-name" 2>/dev/null || true
         
-        echo "Cleaned up Parameter Store"
+        aws ssm delete-parameter \
+          --name "/crm-pipeline/dev/security-group-id" 2>/dev/null || true
+        
+        echo "✅ Parameter Store entries cleaned up"
     
     - name: Cleanup summary
       run: |
-        echo "Cleanup completed for environment: dev"
-        echo "Resources deleted:"
-        echo "- ECS service and cluster"
-        echo "- Kinesis Firehose stream"
-        echo "- IAM roles"
-        echo "- Security group"
-        echo "- CloudWatch log group"
-        echo "- Parameter Store entries"
+        echo "======================================="
+        echo "🎉 CLEANUP COMPLETED"
+        echo "======================================="
+        echo "✅ Environment: $ENVIRONMENT"
+        echo "✅ ECS service and cluster deleted"
+        echo "✅ Kinesis Firehose stream deleted"
+        echo "✅ Security group deleted (with retry logic)"
+        echo "✅ IAM roles deleted"
+        echo "✅ CloudWatch log groups deleted"
+        echo "✅ ECR repository deleted"
+        echo "✅ Parameter Store entries deleted"
         
         if [ "${{ inputs.preserve_s3 }}" = "true" ]; then
-          echo "- S3 bucket preserved: crm-interactions-raw-dev"
+          echo "💾 S3 bucket preserved: $BUCKET_NAME"
+          echo "   To delete later: aws s3 rb s3://$BUCKET_NAME --force"
         else
-          echo "- S3 bucket deleted: crm-interactions-raw-dev"
+          echo "✅ S3 bucket deleted: $BUCKET_NAME"
         fi
+        
+        echo "======================================="
+        echo "🎯 All CRM pipeline resources cleaned up successfully!"
