@@ -157,48 +157,50 @@ jobs:
           --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount,TaskDefinition:taskDefinition}' \
           --output table
         
-        # Check for any deployment issues
-        echo "Checking for deployment issues:"
-        aws ecs describe-services \
+        # Use shorter timeout for quicker feedback
+        echo "Waiting for service to stabilize (timeout: 10 minutes)..."
+        if ! timeout 600 aws ecs wait services-stable \
           --cluster $CLUSTER_NAME \
-          --services $SERVICE_NAME \
-          --query 'services[0].events[0:5]' \
-          --output table
-        
-        # Use a longer timeout and add retry logic
-        echo "Waiting for service to stabilize (timeout: 15 minutes)..."
-        if ! aws ecs wait services-stable \
-          --cluster $CLUSTER_NAME \
-          --services $SERVICE_NAME \
-          --cli-read-timeout 900; then
+          --services $SERVICE_NAME; then
           
           echo "Service did not stabilize within timeout. Checking current status..."
           
           # Get detailed service information
+          echo "=== CURRENT SERVICE STATUS ==="
           aws ecs describe-services \
             --cluster $CLUSTER_NAME \
             --services $SERVICE_NAME \
             --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount,Deployments:deployments}' \
             --output json
           
-          # Check task status
-          echo "Checking task status:"
-          TASK_ARNS=$(aws ecs list-tasks \
+          # Check for stopped tasks - THIS IS THE KEY DIAGNOSTIC STEP
+          echo "=== ANALYZING STOPPED TASKS ==="
+          STOPPED_TASKS=$(aws ecs list-tasks \
             --cluster $CLUSTER_NAME \
             --service-name $SERVICE_NAME \
-            --query 'taskArns' \
+            --desired-status STOPPED \
+            --query 'taskArns[0:5]' \
             --output text)
           
-          if [ -n "$TASK_ARNS" ] && [ "$TASK_ARNS" != "None" ]; then
-            aws ecs describe-tasks \
-              --cluster $CLUSTER_NAME \
-              --tasks $TASK_ARNS \
-              --query 'tasks[0].{TaskArn:taskArn,LastStatus:lastStatus,DesiredStatus:desiredStatus,StoppedReason:stoppedReason}' \
-              --output table
+          if [ -n "$STOPPED_TASKS" ] && [ "$STOPPED_TASKS" != "None" ]; then
+            echo "Found stopped tasks, analyzing reasons..."
+            for task_arn in $STOPPED_TASKS; do
+              if [ -n "$task_arn" ] && [ "$task_arn" != "None" ]; then
+                echo "--- Task: $task_arn ---"
+                aws ecs describe-tasks \
+                  --cluster $CLUSTER_NAME \
+                  --tasks "$task_arn" \
+                  --query 'tasks[0].{TaskArn:taskArn,LastStatus:lastStatus,StoppedReason:stoppedReason,StoppedAt:stoppedAt,Containers:containers[0].{Name:name,LastStatus:lastStatus,Reason:reason,ExitCode:exitCode}}' \
+                  --output json
+                echo ""
+              fi
+            done
+          else
+            echo "No stopped tasks found"
           fi
           
           # Check recent events
-          echo "Recent service events:"
+          echo "=== RECENT SERVICE EVENTS ==="
           aws ecs describe-services \
             --cluster $CLUSTER_NAME \
             --services $SERVICE_NAME \
@@ -210,55 +212,65 @@ jobs:
         
         echo "Service deployment completed successfully"
     
-    - name: Troubleshoot deployment (if failed)
+    - name: Analyze stopped tasks (on failure)
       if: failure()
       run: |
-        echo "=== DEPLOYMENT TROUBLESHOOTING ==="
+        echo "=== DETAILED FAILURE ANALYSIS ==="
         
-        # Check cluster status
-        echo "Cluster information:"
-        aws ecs describe-clusters \
-          --clusters $CLUSTER_NAME \
-          --query 'clusters[0].{ClusterName:clusterName,Status:status,ActiveServicesCount:activeServicesCount,RunningTasksCount:runningTasksCount}' \
-          --output table
-        
-        # Check service details
-        echo "Service details:"
-        aws ecs describe-services \
-          --cluster $CLUSTER_NAME \
-          --services $SERVICE_NAME \
-          --query 'services[0]' \
-          --output json
-        
-        # Check task definition
-        echo "Task definition details:"
-        aws ecs describe-task-definition \
-          --task-definition $TASK_FAMILY \
-          --query 'taskDefinition.{Family:family,Revision:revision,Status:status,RequiresCompatibilities:requiresCompatibilities,NetworkMode:networkMode,Cpu:cpu,Memory:memory}' \
-          --output table
-        
-        # Check for stopped tasks
-        echo "Recent stopped tasks:"
-        aws ecs list-tasks \
+        # Get all stopped tasks from the last hour
+        echo "Getting stopped tasks from the last hour..."
+        STOPPED_TASKS=$(aws ecs list-tasks \
           --cluster $CLUSTER_NAME \
           --service-name $SERVICE_NAME \
           --desired-status STOPPED \
-          --query 'taskArns[0:3]' \
-          --output text | while read -r task_arn; do
+          --query 'taskArns' \
+          --output text)
+        
+        if [ -n "$STOPPED_TASKS" ] && [ "$STOPPED_TASKS" != "None" ]; then
+          echo "Analyzing stopped tasks for failure reasons..."
+          
+          for task_arn in $STOPPED_TASKS; do
             if [ -n "$task_arn" ] && [ "$task_arn" != "None" ]; then
-              echo "Stopped task details:"
-              aws ecs describe-tasks \
+              echo "================================================"
+              echo "TASK: $task_arn"
+              echo "================================================"
+              
+              # Get detailed task information
+              TASK_INFO=$(aws ecs describe-tasks \
                 --cluster $CLUSTER_NAME \
                 --tasks "$task_arn" \
-                --query 'tasks[0].{TaskArn:taskArn,LastStatus:lastStatus,StoppedReason:stoppedReason,StoppedAt:stoppedAt}' \
-                --output table
+                --query 'tasks[0]' \
+                --output json)
+              
+              echo "Task Status:"
+              echo "$TASK_INFO" | jq -r '.lastStatus // "N/A"'
+              
+              echo "Stopped Reason:"
+              echo "$TASK_INFO" | jq -r '.stoppedReason // "N/A"'
+              
+              echo "Stopped At:"
+              echo "$TASK_INFO" | jq -r '.stoppedAt // "N/A"'
+              
+              echo "Container Details:"
+              echo "$TASK_INFO" | jq -r '.containers[] | "Name: \(.name), Status: \(.lastStatus // "N/A"), Reason: \(.reason // "N/A"), ExitCode: \(.exitCode // "N/A")"'
+              
+              echo "Task Definition ARN:"
+              echo "$TASK_INFO" | jq -r '.taskDefinitionArn // "N/A"'
+              
+              echo ""
             fi
           done
+        else
+          echo "No stopped tasks found"
+        fi
         
-        # Check CloudWatch logs
-        echo "Checking CloudWatch logs:"
+        # Check CloudWatch logs for container errors
+        echo "=== CHECKING CLOUDWATCH LOGS ==="
+        LOG_GROUP="/ecs/crm-producer-dev"
+        
+        # Get the most recent log stream
         LOG_STREAM=$(aws logs describe-log-streams \
-          --log-group-name /ecs/crm-producer-dev \
+          --log-group-name "$LOG_GROUP" \
           --order-by LastEventTime \
           --descending \
           --max-items 1 \
@@ -268,14 +280,39 @@ jobs:
         if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
           echo "Recent log entries from $LOG_STREAM:"
           aws logs get-log-events \
-            --log-group-name /ecs/crm-producer-dev \
+            --log-group-name "$LOG_GROUP" \
             --log-stream-name "$LOG_STREAM" \
-            --limit 20 \
+            --limit 50 \
             --query 'events[].message' \
-            --output text
+            --output text | tail -20
         else
-          echo "No logs available"
+          echo "No logs available in log group: $LOG_GROUP"
         fi
+        
+        # Check task definition for common issues
+        echo "=== TASK DEFINITION ANALYSIS ==="
+        aws ecs describe-task-definition \
+          --task-definition $TASK_FAMILY \
+          --query 'taskDefinition.{Family:family,Revision:revision,Cpu:cpu,Memory:memory,NetworkMode:networkMode,ExecutionRole:executionRoleArn,TaskRole:taskRoleArn,ContainerDefinitions:containerDefinitions[0].{Name:name,Image:image,Memory:memory,Cpu:cpu,Essential:essential,LogConfiguration:logConfiguration}}' \
+          --output json
+        
+        # Check subnet and security group
+        echo "=== NETWORK CONFIGURATION ==="
+        VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
+        echo "VPC ID: $VPC_ID"
+        
+        echo "Security Group details:"
+        aws ec2 describe-security-groups \
+          --group-ids $SECURITY_GROUP_ID \
+          --query 'SecurityGroups[0].{GroupId:GroupId,GroupName:GroupName,VpcId:VpcId,InboundRules:IpPermissions,OutboundRules:IpPermissionsEgress}' \
+          --output json
+        
+        # Check if subnets have available IP addresses
+        echo "Subnet IP availability:"
+        aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$VPC_ID" \
+          --query 'Subnets[0:2].{SubnetId:SubnetId,AvailabilityZone:AvailabilityZone,AvailableIpAddressCount:AvailableIpAddressCount,State:State}' \
+          --output table
     
     - name: Verify deployment
       run: |
