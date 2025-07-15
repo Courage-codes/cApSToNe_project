@@ -121,12 +121,13 @@ create_firehose_streams() {
     if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name crm-stream-$ENVIRONMENT"; then
         log_info "Creating CRM Firehose stream"
         
-        # Create configuration file to avoid JSON escaping issues
+        # Create configuration file with ErrorOutputPrefix
         cat > /tmp/crm-firehose-config.json << EOF
 {
     "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
     "BucketARN": "arn:aws:s3:::${bucket_name}",
     "Prefix": "crm/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+    "ErrorOutputPrefix": "errors/crm/",
     "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
     "CompressionFormat": "GZIP"
 }
@@ -142,12 +143,13 @@ EOF
     if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name web-stream-$ENVIRONMENT"; then
         log_info "Creating Web Firehose stream"
         
-        # Create configuration file to avoid JSON escaping issues
+        # Create configuration file with ErrorOutputPrefix
         cat > /tmp/web-firehose-config.json << EOF
 {
     "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
     "BucketARN": "arn:aws:s3:::${bucket_name}",
     "Prefix": "web/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+    "ErrorOutputPrefix": "errors/web/",
     "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
     "CompressionFormat": "GZIP"
 }
