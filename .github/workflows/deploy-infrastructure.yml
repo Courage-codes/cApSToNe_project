@@ -159,6 +159,20 @@ jobs:
         # Wait for IAM roles to be ready
         sleep 30
     
+    - name: Create CloudWatch Log Groups
+      run: |
+        # Create log group for ECS tasks
+        aws logs create-log-group \
+          --log-group-name /ecs/crm-producer-dev \
+          --retention-in-days 30 || true
+        
+        # Create log group for Firehose
+        aws logs create-log-group \
+          --log-group-name /aws/kinesisfirehose/crm-interactions-dev \
+          --retention-in-days 30 || true
+        
+        echo "CloudWatch log groups ready"
+    
     - name: Create Kinesis Firehose Stream
       id: create-firehose
       run: |
@@ -209,14 +223,6 @@ jobs:
           --value "crm-producer-cluster-dev" \
           --type "String" \
           --overwrite
-    
-    - name: Create CloudWatch Log Group
-      run: |
-        aws logs create-log-group \
-          --log-group-name /ecs/crm-producer-dev \
-          --retention-in-days 30 || true
-        
-        echo "CloudWatch log group ready"
     
     - name: Create Security Group
       run: |
