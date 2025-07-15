@@ -1,0 +1,221 @@
+name: Cleanup Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deletion:
+        description: 'Type "DELETE" to confirm'
+        required: true
+        type: string
+      preserve_s3:
+        description: 'Preserve S3 bucket (recommended)'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: dev
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    environment: dev
+    
+    steps:
+    - name: Validate deletion confirmation
+      run: |
+        if [ "${{ inputs.confirm_deletion }}" != "DELETE" ]; then
+          echo "Deletion not confirmed. Please type 'DELETE' to confirm."
+          exit 1
+        fi
+        
+        if [ "$ENVIRONMENT" = "prod" ]; then
+          echo "Production environment cleanup is not allowed through this workflow."
+          exit 1
+        fi
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Set environment variables
+      run: |
+        echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+        echo "BUCKET_NAME=crm-interactions-raw-dev" >> $GITHUB_ENV
+        echo "STREAM_NAME=crm-interactions-stream-dev" >> $GITHUB_ENV
+        echo "CLUSTER_NAME=crm-producer-cluster-dev" >> $GITHUB_ENV
+        echo "SERVICE_NAME=crm-producer-service-dev" >> $GITHUB_ENV
+    
+    - name: Stop and delete ECS service
+      run: |
+        # Scale service to 0
+        if aws ecs describe-services \
+          --cluster $CLUSTER_NAME \
+          --services $SERVICE_NAME \
+          --query 'services[0].serviceName' \
+          --output text 2>/dev/null | grep -q $SERVICE_NAME; then
+          
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --desired-count 0
+          
+          echo "Waiting for service to scale down..."
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME
+          
+          # Delete service
+          aws ecs delete-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME
+          
+          echo "Deleted ECS service: $SERVICE_NAME"
+        else
+          echo "ECS service not found: $SERVICE_NAME"
+        fi
+    
+    - name: Delete ECS cluster
+      run: |
+        if aws ecs describe-clusters \
+          --clusters $CLUSTER_NAME \
+          --query 'clusters[0].clusterName' \
+          --output text 2>/dev/null | grep -q $CLUSTER_NAME; then
+          
+          aws ecs delete-cluster --cluster $CLUSTER_NAME
+          echo "Deleted ECS cluster: $CLUSTER_NAME"
+        else
+          echo "ECS cluster not found: $CLUSTER_NAME"
+        fi
+    
+    - name: Delete Kinesis Firehose stream
+      run: |
+        if aws firehose describe-delivery-stream \
+          --delivery-stream-name $STREAM_NAME 2>/dev/null; then
+          
+          aws firehose delete-delivery-stream \
+            --delivery-stream-name $STREAM_NAME
+          
+          echo "Deleted Firehose stream: $STREAM_NAME"
+        else
+          echo "Firehose stream not found: $STREAM_NAME"
+        fi
+    
+    - name: Delete IAM roles
+      run: |
+        # Delete Firehose delivery role
+        if aws iam get-role --role-name firehose-delivery-role-dev 2>/dev/null; then
+          aws iam delete-role-policy \
+            --role-name firehose-delivery-role-dev \
+            --policy-name S3DeliveryPolicy || true
+          
+          aws iam delete-role \
+            --role-name firehose-delivery-role-dev
+          
+          echo "Deleted Firehose delivery role"
+        fi
+        
+        # Delete ECS task execution role
+        if aws iam get-role --role-name ecsTaskExecutionRole-dev 2>/dev/null; then
+          aws iam detach-role-policy \
+            --role-name ecsTaskExecutionRole-dev \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+          
+          aws iam delete-role \
+            --role-name ecsTaskExecutionRole-dev
+          
+          echo "Deleted ECS task execution role"
+        fi
+        
+        # Delete ECS task role
+        if aws iam get-role --role-name ecsTaskRole-dev 2>/dev/null; then
+          aws iam detach-role-policy \
+            --role-name ecsTaskRole-dev \
+            --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess || true
+          
+          aws iam delete-role \
+            --role-name ecsTaskRole-dev
+          
+          echo "Deleted ECS task role"
+        fi
+    
+    - name: Delete security group
+      run: |
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=crm-producer-sg-dev" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null)
+        
+        if [ "$SG_ID" != "None" ] && [ -n "$SG_ID" ]; then
+          aws ec2 delete-security-group --group-id $SG_ID
+          echo "Deleted security group: $SG_ID"
+        else
+          echo "Security group not found"
+        fi
+    
+    - name: Delete CloudWatch log group
+      run: |
+        aws logs delete-log-group \
+          --log-group-name /ecs/crm-producer-dev || true
+        
+        echo "Deleted CloudWatch log group"
+    
+    - name: Delete ECR repository
+      run: |
+        aws ecr delete-repository \
+          --repository-name crm-producer \
+          --force 2>/dev/null || true
+        
+        echo "ECR repository cleanup attempted"
+    
+    - name: Handle S3 bucket
+      run: |
+        if [ "${{ inputs.preserve_s3 }}" = "true" ]; then
+          echo "S3 bucket preserved: crm-interactions-raw-dev"
+          echo "To delete manually later: aws s3 rb s3://crm-interactions-raw-dev --force"
+        else
+          if aws s3api head-bucket --bucket crm-interactions-raw-dev 2>/dev/null; then
+            aws s3 rm s3://crm-interactions-raw-dev --recursive
+            aws s3api delete-bucket --bucket crm-interactions-raw-dev
+            echo "Deleted S3 bucket: crm-interactions-raw-dev"
+          else
+            echo "S3 bucket not found: crm-interactions-raw-dev"
+          fi
+        fi
+    
+    - name: Clean up Parameter Store
+      run: |
+        aws ssm delete-parameter \
+          --name "/crm-pipeline/dev/bucket-name" || true
+        
+        aws ssm delete-parameter \
+          --name "/crm-pipeline/dev/firehose-stream" || true
+        
+        aws ssm delete-parameter \
+          --name "/crm-pipeline/dev/cluster-name" || true
+        
+        aws ssm delete-parameter \
+          --name "/crm-pipeline/dev/security-group-id" || true
+        
+        echo "Cleaned up Parameter Store"
+    
+    - name: Cleanup summary
+      run: |
+        echo "Cleanup completed for environment: dev"
+        echo "Resources deleted:"
+        echo "- ECS service and cluster"
+        echo "- Kinesis Firehose stream"
+        echo "- IAM roles"
+        echo "- Security group"
+        echo "- CloudWatch log group"
+        echo "- Parameter Store entries"
+        
+        if [ "${{ inputs.preserve_s3 }}" = "true" ]; then
+          echo "- S3 bucket preserved: crm-interactions-raw-dev"
+        else
+          echo "- S3 bucket deleted: crm-interactions-raw-dev"
+        fi

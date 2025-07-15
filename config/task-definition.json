@@ -1,0 +1,69 @@
+{
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/ecsTaskExecutionRole-ENVIRONMENT_PLACEHOLDER",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/ecsTaskRole-ENVIRONMENT_PLACEHOLDER",
+  "containerDefinitions": [
+    {
+      "name": "crm-producer",
+      "image": "IMAGE_URI_PLACEHOLDER",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "CRM_API_URL",
+          "value": "http://3.248.199.26:8000/api/customer-interaction/"
+        },
+        {
+          "name": "FIREHOSE_STREAM_NAME",
+          "value": "FIREHOSE_STREAM_PLACEHOLDER"
+        },
+        {
+          "name": "POLL_INTERVAL",
+          "value": "30"
+        },
+        {
+          "name": "MAX_RETRIES",
+          "value": "3"
+        },
+        {
+          "name": "RETRY_DELAY",
+          "value": "60"
+        },
+        {
+          "name": "BATCH_SIZE",
+          "value": "100"
+        },
+        {
+          "name": "AWS_DEFAULT_REGION",
+          "value": "AWS_REGION_PLACEHOLDER"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/crm-producer-ENVIRONMENT_PLACEHOLDER",
+          "awslogs-region": "AWS_REGION_PLACEHOLDER",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "BucketARN": "arn:aws:s3:::BUCKET_NAME_PLACEHOLDER",
+  "Prefix": "year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+  "ErrorOutputPrefix": "errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/",
+  "BufferingHints": {
+    "SizeInMBs": 5,
+    "IntervalInSeconds": 300
+  },
+  "CompressionFormat": "GZIP",
+  "EncryptionConfiguration": {
+    "NoEncryptionConfig": "NoEncryption"
+  },
+  "CloudWatchLoggingOptions": {
+    "Enabled": true,
+    "LogGroupName": "/aws/kinesisfirehose/crm-interactions-ENVIRONMENT_PLACEHOLDER"
+  },
+  "ProcessingConfiguration": {
+    "Enabled": false
+  },
+  "RoleARN": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/firehose-delivery-role-ENVIRONMENT_PLACEHOLDER",
+  "DynamicPartitioning": {
+    "Enabled": false
+  }
+}

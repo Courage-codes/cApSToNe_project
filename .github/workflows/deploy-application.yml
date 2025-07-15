@@ -1,0 +1,197 @@
+name: Deploy Application
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'config/task-definition.json'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag (default: commit SHA)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: dev
+  ECR_REPOSITORY: crm-producer
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Set environment variables
+      run: |
+        IMAGE_TAG=${{ inputs.image_tag || github.sha }}
+        echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "SERVICE_NAME=crm-producer-service-dev" >> $GITHUB_ENV
+        echo "TASK_FAMILY=crm-producer-task-dev" >> $GITHUB_ENV
+    
+    - name: Retrieve infrastructure configuration
+      run: |
+        # Get configuration from Parameter Store
+        BUCKET_NAME=$(aws ssm get-parameter \
+          --name "/crm-pipeline/dev/bucket-name" \
+          --query 'Parameter.Value' \
+          --output text)
+        
+        FIREHOSE_STREAM=$(aws ssm get-parameter \
+          --name "/crm-pipeline/dev/firehose-stream" \
+          --query 'Parameter.Value' \
+          --output text)
+        
+        CLUSTER_NAME=$(aws ssm get-parameter \
+          --name "/crm-pipeline/dev/cluster-name" \
+          --query 'Parameter.Value' \
+          --output text)
+        
+        SECURITY_GROUP_ID=$(aws ssm get-parameter \
+          --name "/crm-pipeline/dev/security-group-id" \
+          --query 'Parameter.Value' \
+          --output text)
+        
+        echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_ENV
+        echo "FIREHOSE_STREAM=$FIREHOSE_STREAM" >> $GITHUB_ENV
+        echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+        echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID" >> $GITHUB_ENV
+        
+        echo "Retrieved configuration for environment: dev"
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+    
+    - name: Build, tag, and push image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      run: |
+        # Create ECR repository if it doesn't exist
+        aws ecr describe-repositories --repository-names $ECR_REPOSITORY || \
+        aws ecr create-repository --repository-name $ECR_REPOSITORY
+        
+        # Build and push Docker image
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG src/fargate-producer/
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # Tag as latest for the environment
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:dev-latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:dev-latest
+        
+        echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+        
+        echo "Built and pushed image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+    
+    - name: Update task definition
+      run: |
+        # Update task definition template
+        sed "s/ACCOUNT_ID_PLACEHOLDER/${{ secrets.AWS_ACCOUNT_ID }}/g" config/task-definition.json > /tmp/task-definition.json
+        sed -i "s/ENVIRONMENT_PLACEHOLDER/dev/g" /tmp/task-definition.json
+        sed -i "s/IMAGE_URI_PLACEHOLDER/$IMAGE_URI/g" /tmp/task-definition.json
+        sed -i "s/FIREHOSE_STREAM_PLACEHOLDER/$FIREHOSE_STREAM/g" /tmp/task-definition.json
+        sed -i "s/AWS_REGION_PLACEHOLDER/$AWS_REGION/g" /tmp/task-definition.json
+        
+        # Register new task definition
+        aws ecs register-task-definition \
+          --family $TASK_FAMILY \
+          --cli-input-json file:///tmp/task-definition.json
+        
+        echo "Registered new task definition: $TASK_FAMILY"
+    
+    - name: Deploy to ECS
+      run: |
+        # Get default VPC subnets
+        VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
+        SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0:2].SubnetId' --output text | tr '\t' ',')
+        
+        # Check if service exists
+        if aws ecs describe-services \
+          --cluster $CLUSTER_NAME \
+          --services $SERVICE_NAME \
+          --query 'services[0].serviceName' \
+          --output text 2>/dev/null | grep -q $SERVICE_NAME; then
+          
+          # Update existing service
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --task-definition $TASK_FAMILY
+          
+          echo "Updated existing service: $SERVICE_NAME"
+        else
+          # Create new service
+          aws ecs create-service \
+            --cluster $CLUSTER_NAME \
+            --service-name $SERVICE_NAME \
+            --task-definition $TASK_FAMILY \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}"
+          
+          echo "Created new service: $SERVICE_NAME"
+        fi
+    
+    - name: Wait for deployment
+      run: |
+        echo "Waiting for service deployment to complete..."
+        aws ecs wait services-stable \
+          --cluster $CLUSTER_NAME \
+          --services $SERVICE_NAME \
+          --max-attempts 20 \
+          --delay 30
+        
+        echo "Service deployment completed successfully"
+    
+    - name: Verify deployment
+      run: |
+        # Check service status
+        SERVICE_STATUS=$(aws ecs describe-services \
+          --cluster $CLUSTER_NAME \
+          --services $SERVICE_NAME \
+          --query 'services[0].{ServiceName:serviceName,Status:status,Running:runningCount,Desired:desiredCount}')
+        
+        echo "Service Status:"
+        echo "$SERVICE_STATUS"
+        
+        # Get recent log entries
+        echo "Recent log entries:"
+        LOG_STREAM=$(aws logs describe-log-streams \
+          --log-group-name /ecs/crm-producer-dev \
+          --order-by LastEventTime \
+          --descending \
+          --max-items 1 \
+          --query 'logStreams[0].logStreamName' \
+          --output text 2>/dev/null)
+        
+        if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
+          aws logs get-log-events \
+            --log-group-name /ecs/crm-producer-dev \
+            --log-stream-name "$LOG_STREAM" \
+            --limit 10 \
+            --query 'events[].message' \
+            --output text
+        else
+          echo "No logs available yet"
+        fi
+    
+    - name: Output deployment summary
+      run: |
+        echo "Application deployment completed successfully!"
+        echo "Environment: dev"
+        echo "Image: $IMAGE_URI"
+        echo "Service: $SERVICE_NAME"
+        echo "Cluster: $CLUSTER_NAME"
