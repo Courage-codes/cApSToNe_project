@@ -287,25 +287,20 @@ jobs:
         if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
           echo "Log group $LOG_GROUP_NAME exists"
           
-          # Get the most recent log stream
-          LOG_STREAM=$(aws logs describe-log-streams \
+          # Get recent log events from all streams
+          echo "Checking recent log events from all streams..."
+          RECENT_EVENTS=$(aws logs filter-log-events \
             --log-group-name "$LOG_GROUP_NAME" \
-            --order-by LastEventTime \
-            --descending \
-            --max-items 1 \
-            --query 'logStreams[0].logStreamName' \
+            --start-time $(date -d '30 minutes ago' +%s)000 \
+            --limit 50 \
+            --query 'events[].message' \
             --output text 2>/dev/null)
           
-          if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ]; then
-            echo "Recent log entries from $LOG_STREAM:"
-            aws logs get-log-events \
-              --log-group-name "$LOG_GROUP_NAME" \
-              --log-stream-name "$LOG_STREAM" \
-              --limit 50 \
-              --query 'events[].message' \
-              --output text | tail -20
+          if [ -n "$RECENT_EVENTS" ] && [ "$RECENT_EVENTS" != "None" ]; then
+            echo "Recent log entries:"
+            echo "$RECENT_EVENTS" | tail -20
           else
-            echo "No log streams found in log group: $LOG_GROUP_NAME"
+            echo "No recent log entries found"
           fi
         else
           echo "Log group $LOG_GROUP_NAME does not exist"
@@ -358,36 +353,40 @@ jobs:
           exit 1
         fi
         
-        # Get recent log entries with better error handling
+        # Get recent log entries with improved error handling
         echo "Checking for recent log entries..."
         
         # Check if log group exists
         if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
-          echo "Log group exists, checking for log streams..."
+          echo "Log group exists, checking for recent events..."
           
           # Wait a bit for logs to appear
           sleep 10
           
-          # Get the most recent log stream
-          LOG_STREAM=$(aws logs describe-log-streams \
+          # Get recent log events from all streams using filter-log-events
+          RECENT_EVENTS=$(aws logs filter-log-events \
             --log-group-name "$LOG_GROUP_NAME" \
-            --order-by LastEventTime \
-            --descending \
-            --max-items 1 \
-            --query 'logStreams[0].logStreamName' \
+            --start-time $(date -d '10 minutes ago' +%s)000 \
+            --limit 10 \
+            --query 'events[].message' \
             --output text 2>/dev/null)
           
-          if [ "$LOG_STREAM" != "None" ] && [ -n "$LOG_STREAM" ] && [ "$LOG_STREAM" != "null" ]; then
-            echo "Recent log entries from $LOG_STREAM:"
-            aws logs get-log-events \
-              --log-group-name "$LOG_GROUP_NAME" \
-              --log-stream-name "$LOG_STREAM" \
-              --limit 10 \
-              --query 'events[].message' \
-              --output text
+          if [ -n "$RECENT_EVENTS" ] && [ "$RECENT_EVENTS" != "None" ]; then
+            echo "Recent log entries:"
+            echo "$RECENT_EVENTS"
           else
-            echo "No log streams available yet (this is normal for new deployments)"
+            echo "No recent log entries found (this is normal for new deployments)"
             echo "The application may still be starting up. Check logs later if needed."
+            
+            # List available log streams for debugging
+            echo "Available log streams:"
+            aws logs describe-log-streams \
+              --log-group-name "$LOG_GROUP_NAME" \
+              --order-by LastEventTime \
+              --descending \
+              --max-items 5 \
+              --query 'logStreams[].{StreamName:logStreamName,LastEventTime:lastEventTime}' \
+              --output table 2>/dev/null || echo "No log streams found"
           fi
         else
           echo "Log group $LOG_GROUP_NAME does not exist yet"
