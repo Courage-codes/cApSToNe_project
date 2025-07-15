@@ -1,7 +1,7 @@
 {
   "BucketARN": "arn:aws:s3:::BUCKET_NAME_PLACEHOLDER",
   "Prefix": "year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
-  "ErrorOutputPrefix": "errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/",
+  "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/",
   "BufferingHints": {
     "SizeInMBs": 5,
     "IntervalInSeconds": 300
