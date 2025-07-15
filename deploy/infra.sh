@@ -15,7 +15,7 @@ resource_exists() {
 }
 
 create_s3_bucket() {
-    local bucket_name="data-pipeline-${ENVIRONMENT}"
+    local bucket_name="data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}"
     
     if resource_exists "aws s3api head-bucket --bucket $bucket_name"; then
         log_info "S3 bucket exists: $bucket_name"
@@ -99,8 +99,8 @@ create_iam_roles() {
                     "s3:PutObject"
                 ],
                 "Resource": [
-                    "arn:aws:s3:::data-pipeline-'$ENVIRONMENT'",
-                    "arn:aws:s3:::data-pipeline-'$ENVIRONMENT'/*"
+                    "arn:aws:s3:::data-pipeline-'$ENVIRONMENT'-'$ACCOUNT_ID'",
+                    "arn:aws:s3:::data-pipeline-'$ENVIRONMENT'-'$ACCOUNT_ID'/*"
                 ]
             }]
         }'
@@ -108,7 +108,7 @@ create_iam_roles() {
 }
 
 create_firehose_streams() {
-    local bucket_name="data-pipeline-${ENVIRONMENT}"
+    local bucket_name="data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}"
     
     # CRM Stream
     if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name crm-stream-$ENVIRONMENT"; then
