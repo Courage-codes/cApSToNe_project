@@ -1,8 +1,6 @@
 name: Deploy Infrastructure
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       force_recreate:
@@ -10,6 +8,7 @@ on:
         required: false
         default: false
         type: boolean
+  # Removed: push trigger
 
 env:
   AWS_REGION: us-east-1
