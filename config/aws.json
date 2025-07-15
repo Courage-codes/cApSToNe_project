@@ -1,0 +1,21 @@
+{
+  "region": "eu-west-1",
+  "environments": {
+    "dev": {
+      "cluster": "data-pipeline-cluster-dev",
+      "bucket": "data-pipeline-dev",
+      "streams": {
+        "crm": "crm-stream-dev",
+        "web": "web-stream-dev"
+      }
+    },
+    "prod": {
+      "cluster": "data-pipeline-cluster-prod",
+      "bucket": "data-pipeline-prod",
+      "streams": {
+        "crm": "crm-stream-prod",
+        "web": "web-stream-prod"
+      }
+    }
+  }
+}

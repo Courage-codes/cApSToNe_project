@@ -1,0 +1,58 @@
+{
+  "family": "web-task-{environment}",
+  "cpu": "512",
+  "memory": "1024",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "executionRoleArn": "arn:aws:iam::{account}:role/ecs-execution-role-{environment}",
+  "taskRoleArn": "arn:aws:iam::{account}:role/ecs-task-role-{environment}",
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "{image_uri}",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "API_URL",
+          "value": "http://3.248.199.26:8000/api/web-traffic/"
+        },
+        {
+          "name": "STREAM_NAME",
+          "value": "web-stream-{environment}"
+        },
+        {
+          "name": "POLL_INTERVAL",
+          "value": "30"
+        },
+        {
+          "name": "AWS_DEFAULT_REGION",
+          "value": "eu-west-1"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/web-{environment}",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
