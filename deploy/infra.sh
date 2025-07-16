@@ -296,15 +296,22 @@ create_security_group() {
         --overwrite
 }
 
-create_log_groups() {
-    for service in crm web; do
-        local log_group="/ecs/$service-$ENVIRONMENT"
-        if ! resource_exists "aws logs describe-log-groups --log-group-name-prefix $log_group"; then
-            log_info "Creating log group: $log_group"
-            aws logs create-log-group --log-group-name "$log_group"
-            aws logs put-retention-policy --log-group-name "$log_group" --retention-in-days 30
-        fi
-    done
+create_log_group() {
+    local log_group_name="/ecs/$SERVICE-$ENVIRONMENT"
+    
+    log_info "Creating CloudWatch log group: $log_group_name"
+    
+    # Check if log group exists
+    if aws logs describe-log-groups --log-group-name-prefix "$log_group_name" --query "logGroups[?logGroupName=='$log_group_name']" --output text | grep -q "$log_group_name"; then
+        log_info "Log group already exists: $log_group_name"
+    else
+        aws logs create-log-group --log-group-name "$log_group_name"
+        log_info "Created log group: $log_group_name"
+    fi
+    
+    # Set retention policy (optional - keeps logs for 30 days)
+    aws logs put-retention-policy --log-group-name "$log_group_name" --retention-in-days 30
+    log_info "Set log retention policy to 30 days"
 }
 
 # Main execution
