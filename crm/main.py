@@ -37,7 +37,6 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({'error': 'Not found'}).encode())
 
     def log_message(self, format, *args):
-        # Suppress default HTTP server logs to reduce noise
         pass
 
 class CRMProducer:
@@ -46,9 +45,7 @@ class CRMProducer:
         self.stream_name = os.getenv('STREAM_NAME', 'crm-stream-dev')
         self.poll_interval = int(os.getenv('POLL_INTERVAL', '30'))
         self.region = os.getenv('AWS_DEFAULT_REGION', 'eu-west-1')
-        self.health_server = None
         
-        # Initialize AWS client
         try:
             self.firehose = boto3.client('firehose', region_name=self.region)
             logger.info(f"Successfully initialized Firehose client for region: {self.region}")
@@ -61,26 +58,23 @@ class CRMProducer:
     def start_health_server(self):
         """Start health check server on port 8080"""
         try:
-            # Bind to all interfaces for container compatibility
-            self.health_server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
-            thread = Thread(target=self.health_server.serve_forever, daemon=True)
+            server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
+            thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             logger.info("Health check server started successfully on port 8080")
             
-            # Wait a bit longer for server to be ready
-            time.sleep(3)
-            
-            # Test the health endpoint
+            time.sleep(1)
             try:
-                response = requests.get('http://localhost:8080/health', timeout=5)
-                if response.status_code == 200:
+                import urllib.request
+                response = urllib.request.urlopen('http://localhost:8080/health', timeout=5)
+                if response.getcode() == 200:
                     logger.info("Health endpoint verified - responding correctly")
                 else:
-                    logger.warning(f"Health endpoint returned status: {response.status_code}")
+                    logger.warning(f"Health endpoint returned status: {response.getcode()}")
             except Exception as e:
                 logger.warning(f"Could not verify health endpoint: {e}")
             
-            return self.health_server
+            return server
         except Exception as e:
             logger.error(f"Failed to start health server: {e}")
             raise
@@ -91,11 +85,40 @@ class CRMProducer:
             logger.info(f"Polling CRM API: {self.api_url}")
             response = requests.get(self.api_url, timeout=30)
             response.raise_for_status()
-            data = response.json()
+            
+            # Parse JSON response
+            json_response = response.json()
+            
+            # Check if API returned an error
+            if isinstance(json_response, dict) and 'error' in json_response:
+                logger.warning(f"API returned error: {json_response['error']}")
+                return None
+            
+            # Handle different response formats
+            if isinstance(json_response, list):
+                # Response is already a list
+                data = json_response
+            elif isinstance(json_response, dict):
+                # Single record response - wrap in list
+                data = [json_response]
+            else:
+                logger.error(f"Unexpected response format: {type(json_response)}")
+                return None
+            
             logger.info(f"Successfully fetched {len(data)} records from CRM API")
+            
+            # Log sample record for debugging
+            if data and len(data) > 0:
+                logger.info(f"Sample record: {data[0]}")
+            
             return data
+            
         except requests.RequestException as e:
             logger.error(f"API request failed: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            logger.error(f"Response content: {response.text[:200]}...")
             return None
         except Exception as e:
             logger.error(f"Unexpected error fetching data: {e}")
@@ -103,13 +126,30 @@ class CRMProducer:
 
     def process_record(self, record: Dict) -> Dict:
         """Process and enrich a single record"""
-        return {
-            **record,
-            'processed_at': datetime.utcnow().isoformat(),
-            'source': 'crm-api',
-            'pipeline': 'crm-processor',
-            'region': self.region
-        }
+        try:
+            # Ensure record is a dictionary
+            if not isinstance(record, dict):
+                logger.warning(f"Invalid record type: {type(record)}, converting to dict")
+                record = {"raw_data": str(record)}
+            
+            # Skip error records
+            if 'error' in record:
+                logger.debug(f"Skipping error record: {record}")
+                return None
+            
+            # Enrich the record
+            enriched_record = {
+                **record,
+                'processed_at': datetime.utcnow().isoformat(),
+                'source': 'crm-api',
+                'pipeline': 'crm-processor',
+                'region': self.region
+            }
+            
+            return enriched_record
+        except Exception as e:
+            logger.error(f"Error processing record: {e}")
+            return None
 
     def send_to_firehose(self, records: List[Dict]) -> bool:
         """Send records to Kinesis Firehose"""
@@ -117,13 +157,27 @@ class CRMProducer:
             if not records:
                 logger.info("No records to send to Firehose")
                 return True
-                
-            firehose_records = [
-                {'Data': json.dumps(self.process_record(record)) + '\n'}
-                for record in records
-            ]
+            
+            # Process each record and create Firehose records
+            firehose_records = []
+            for record in records:
+                try:
+                    processed_record = self.process_record(record)
+                    if processed_record is not None:  # Skip None records (errors)
+                        firehose_record = {
+                            'Data': json.dumps(processed_record) + '\n'
+                        }
+                        firehose_records.append(firehose_record)
+                except Exception as e:
+                    logger.error(f"Error processing individual record: {e}")
+                    continue
+            
+            if not firehose_records:
+                logger.info("No valid records to send to Firehose after processing")
+                return True  # Return True since this isn't an error
             
             logger.info(f"Sending {len(firehose_records)} records to Firehose stream: {self.stream_name}")
+            
             response = self.firehose.put_record_batch(
                 DeliveryStreamName=self.stream_name,
                 Records=firehose_records
@@ -132,9 +186,13 @@ class CRMProducer:
             failed_count = response.get('FailedPutCount', 0)
             if failed_count > 0:
                 logger.warning(f"Failed to send {failed_count} records to Firehose")
+                # Log details of failed records
+                for i, record_result in enumerate(response.get('RequestResponses', [])):
+                    if 'ErrorCode' in record_result:
+                        logger.error(f"Record {i} failed: {record_result}")
                 return False
             
-            logger.info(f"Successfully sent {len(records)} records to Firehose")
+            logger.info(f"Successfully sent {len(firehose_records)} records to Firehose")
             return True
             
         except Exception as e:
@@ -156,29 +214,19 @@ class CRMProducer:
         except Exception as e:
             logger.error(f"Error in polling cycle: {e}")
 
-    def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("Shutting down CRM Producer")
-        if self.health_server:
-            self.health_server.shutdown()
-            logger.info("Health server stopped")
-
     def run(self):
         """Main run loop"""
         logger.info("Starting CRM Producer")
         
-        # Start health check server first
         try:
-            self.start_health_server()
+            health_server = self.start_health_server()
             logger.info("Health server started successfully")
         except Exception as e:
             logger.error(f"Failed to start health server: {e}")
             return
         
-        # Give more time for health server to fully initialize
-        time.sleep(5)
+        time.sleep(2)
         
-        # Main processing loop
         try:
             logger.info(f"Starting main polling loop with {self.poll_interval}s interval")
             cycle_count = 0
@@ -190,10 +238,8 @@ class CRMProducer:
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             logger.info("Received interrupt signal, shutting down CRM Producer")
-            self.shutdown()
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
-            self.shutdown()
             raise
 
 if __name__ == "__main__":
