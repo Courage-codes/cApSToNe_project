@@ -88,24 +88,25 @@ class WebProducer:
             
             # Parse JSON response
             json_response = response.json()
+            logger.info(f"Raw API response type: {type(json_response)}")
             
             # Check if API returned an error
             if isinstance(json_response, dict) and 'error' in json_response:
                 logger.warning(f"API returned error: {json_response['error']}")
                 return None
             
-            # Handle different response formats
-            if isinstance(json_response, list):
-                # Response is a list
-                data = json_response
-            elif isinstance(json_response, dict):
+            # CRITICAL FIX: Normalize response to list format
+            if isinstance(json_response, dict):
                 # Single record response - wrap in list
                 data = [json_response]
+                logger.info(f"Successfully fetched 1 record from Web API (wrapped single object)")
+            elif isinstance(json_response, list):
+                # Array response - use as-is
+                data = json_response
+                logger.info(f"Successfully fetched {len(data)} records from Web API")
             else:
                 logger.error(f"Unexpected response format: {type(json_response)}")
                 return None
-            
-            logger.info(f"Successfully fetched {len(data)} records from Web API")
             
             # Log sample record for debugging
             if data and len(data) > 0:
@@ -130,14 +131,17 @@ class WebProducer:
             if not isinstance(record, dict):
                 return False
             
-            # Check if it has expected web traffic fields
-            expected_fields = ['session_id', 'user_id', 'page', 'device_type', 'browser', 'event_type', 'timestamp']
+            # Check if record has expected web traffic fields
+            required_fields = ['session_id', 'page', 'device_type', 'browser', 'event_type', 'timestamp']
             
-            # Must have at least some of these fields
-            has_fields = sum(1 for field in expected_fields if field in record)
+            # Must have at least 4 of these fields
+            has_fields = sum(1 for field in required_fields if field in record)
             
-            if has_fields >= 3:  # At least 3 expected fields
-                return True
+            if has_fields >= 4:
+                # Additional validation: check if values are reasonable
+                # user_id can be None, so we don't require it
+                if 'timestamp' in record and record['timestamp'] is not None:
+                    return True
             
             return False
         except Exception as e:
@@ -211,6 +215,10 @@ class WebProducer:
             failed_count = response.get('FailedPutCount', 0)
             if failed_count > 0:
                 logger.warning(f"Failed to send {failed_count} records to Firehose")
+                # Log details of failed records
+                for i, record_result in enumerate(response.get('RequestResponses', [])):
+                    if 'ErrorCode' in record_result:
+                        logger.error(f"Record {i} failed: {record_result}")
                 return False
             
             logger.info(f"Successfully sent {len(firehose_records)} records to Firehose")

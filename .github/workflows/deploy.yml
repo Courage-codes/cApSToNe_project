@@ -1,60 +1,66 @@
+# .github/workflows/deploy.yml
 name: Deploy Services
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'crm/**'
-      - 'web/**'
-      - 'config/**'
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       service:
-        description: 'Service to deploy'
-        required: true
+        description: 'Service to deploy (crm, web or both)'
+        required: false
+        default: 'both'
         type: choice
         options:
           - crm
           - web
           - both
-        default: both
-
-env:
-  AWS_REGION: eu-west-1
-  ENVIRONMENT: dev
+      environment:
+        description: 'Environment to deploy to'
+        required: false
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: dev
-    strategy:
-      matrix:
-        service: ${{ inputs.service == 'both' && fromJson('["crm", "web"]') || fromJson(format('["{0}"]', inputs.service)) }}
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Deploy ${{ matrix.service }} service
-      run: |
-        chmod +x deploy/build.sh
-        ./deploy/build.sh ${{ matrix.service }} ${{ env.ENVIRONMENT }}
-    
-    - name: Verify deployment
-      run: |
-        SERVICE_NAME=${{ matrix.service }}-service-${{ env.ENVIRONMENT }}
-        CLUSTER_NAME=data-pipeline-cluster-${{ env.ENVIRONMENT }}
-        
-        SERVICE_STATUS=$(aws ecs describe-services \
-          --cluster $CLUSTER_NAME \
-          --services $SERVICE_NAME \
-          --query 'services[0].{Running:runningCount,Desired:desiredCount,Status:status}')
-        
-        echo "Service Status: $SERVICE_STATUS"
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - name: Determine services to deploy
+        id: vars
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # on push to main, always deploy both
+            echo "::set-output name=services::crm,web"
+          else
+            # manual: use the chosen input
+            svc="${{ github.event.inputs.service }}"
+            if [[ "$svc" == "both" || -z "$svc" ]]; then
+              echo "::set-output name=services::crm,web"
+            else
+              echo "::set-output name=services::$svc"
+            fi
+          fi
+
+      - name: Deploy each service
+        run: |
+          ENV=${{ github.event.inputs.environment }}
+          IFS=',' read -r -a svcs <<< "${{ steps.vars.outputs.services }}"
+          for SVC in "${svcs[@]}"; do
+            echo ">>> Deploying $SVC to $ENV"
+            chmod +x deploy/build.sh
+            ./deploy/build.sh $SVC $ENV
+          done
