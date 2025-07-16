@@ -18,12 +18,12 @@ COPY main.py .
 RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Health check that matches ECS configuration
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
-    CMD curl -f http://localhost:8080/health || exit 1
-
 # Expose port for health check
 EXPOSE 8080
+
+# Health check with more generous timing
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the application
 CMD ["python", "main.py"]

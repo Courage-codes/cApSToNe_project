@@ -46,6 +46,7 @@ class CRMProducer:
         self.stream_name = os.getenv('STREAM_NAME', 'crm-stream-dev')
         self.poll_interval = int(os.getenv('POLL_INTERVAL', '30'))
         self.region = os.getenv('AWS_DEFAULT_REGION', 'eu-west-1')
+        self.health_server = None
         
         # Initialize AWS client
         try:
@@ -60,24 +61,26 @@ class CRMProducer:
     def start_health_server(self):
         """Start health check server on port 8080"""
         try:
-            server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
-            thread = Thread(target=server.serve_forever, daemon=True)
+            # Bind to all interfaces for container compatibility
+            self.health_server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
+            thread = Thread(target=self.health_server.serve_forever, daemon=True)
             thread.start()
             logger.info("Health check server started successfully on port 8080")
             
-            # Test the health endpoint immediately
-            time.sleep(1)  # Give server a moment to start
+            # Wait a bit longer for server to be ready
+            time.sleep(3)
+            
+            # Test the health endpoint
             try:
-                import urllib.request
-                response = urllib.request.urlopen('http://localhost:8080/health', timeout=5)
-                if response.getcode() == 200:
+                response = requests.get('http://localhost:8080/health', timeout=5)
+                if response.status_code == 200:
                     logger.info("Health endpoint verified - responding correctly")
                 else:
-                    logger.warning(f"Health endpoint returned status: {response.getcode()}")
+                    logger.warning(f"Health endpoint returned status: {response.status_code}")
             except Exception as e:
                 logger.warning(f"Could not verify health endpoint: {e}")
             
-            return server
+            return self.health_server
         except Exception as e:
             logger.error(f"Failed to start health server: {e}")
             raise
@@ -153,20 +156,27 @@ class CRMProducer:
         except Exception as e:
             logger.error(f"Error in polling cycle: {e}")
 
+    def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("Shutting down CRM Producer")
+        if self.health_server:
+            self.health_server.shutdown()
+            logger.info("Health server stopped")
+
     def run(self):
         """Main run loop"""
         logger.info("Starting CRM Producer")
         
         # Start health check server first
         try:
-            health_server = self.start_health_server()
+            self.start_health_server()
             logger.info("Health server started successfully")
         except Exception as e:
             logger.error(f"Failed to start health server: {e}")
             return
         
-        # Give the health server time to fully initialize
-        time.sleep(2)
+        # Give more time for health server to fully initialize
+        time.sleep(5)
         
         # Main processing loop
         try:
@@ -180,8 +190,10 @@ class CRMProducer:
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             logger.info("Received interrupt signal, shutting down CRM Producer")
+            self.shutdown()
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
+            self.shutdown()
             raise
 
 if __name__ == "__main__":
