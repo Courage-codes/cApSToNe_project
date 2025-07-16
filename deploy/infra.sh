@@ -1,9 +1,211 @@
+#!/bin/bash
+set -euo pipefail
+
+ENVIRONMENT=${1:-dev}
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION=${AWS_REGION:-eu-west-1}
+
+log_info() {
+    echo "$(date '+%H:%M:%S') [INFO] $1"
+}
+
+log_error() {
+    echo "$(date '+%H:%M:%S') [ERROR] $1" >&2
+}
+
+resource_exists() {
+    local check_command="$1"
+    eval "$check_command" &>/dev/null
+}
+
+create_s3_bucket() {
+    local bucket_name="data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}"
+    
+    if resource_exists "aws s3api head-bucket --bucket $bucket_name"; then
+        log_info "S3 bucket exists: $bucket_name"
+    else
+        log_info "Creating S3 bucket: $bucket_name in region: $REGION"
+        if [[ "$REGION" == "us-east-1" ]]; then
+            aws s3api create-bucket --bucket "$bucket_name" --region "$REGION"
+        else
+            aws s3api create-bucket \
+                --bucket "$bucket_name" \
+                --region "$REGION" \
+                --create-bucket-configuration LocationConstraint="$REGION"
+        fi
+        
+        log_info "Configuring bucket versioning and lifecycle"
+        aws s3api put-bucket-versioning --bucket "$bucket_name" --versioning-configuration Status=Enabled
+        
+        aws s3api put-bucket-lifecycle-configuration --bucket "$bucket_name" --lifecycle-configuration '{
+            "Rules": [{
+                "ID": "DeleteOldData",
+                "Status": "Enabled",
+                "Filter": {"Prefix": ""},
+                "Expiration": {"Days": 90}
+            }]
+        }'
+    fi
+    
+    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/bucket-name" --value "$bucket_name" --type String --overwrite
+}
+
+create_iam_roles() {
+    if ! resource_exists "aws iam get-role --role-name ecs-execution-role-$ENVIRONMENT"; then
+        log_info "Creating ECS execution role"
+        aws iam create-role --role-name "ecs-execution-role-$ENVIRONMENT" --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }'
+        aws iam attach-role-policy --role-name "ecs-execution-role-$ENVIRONMENT" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    fi
+    
+    if ! resource_exists "aws iam get-role --role-name ecs-task-role-$ENVIRONMENT"; then
+        log_info "Creating ECS task role"
+        aws iam create-role --role-name "ecs-task-role-$ENVIRONMENT" --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }'
+        aws iam attach-role-policy --role-name "ecs-task-role-$ENVIRONMENT" --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+    fi
+    
+    if ! resource_exists "aws iam get-role --role-name firehose-role-$ENVIRONMENT"; then
+        log_info "Creating Firehose role"
+        aws iam create-role --role-name "firehose-role-$ENVIRONMENT" --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "firehose.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }'
+        
+        cat > /tmp/firehose-policy.json << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": [
+            "s3:AbortMultipartUpload",
+            "s3:GetBucketLocation",
+            "s3:GetObject",
+            "s3:ListBucket",
+            "s3:ListBucketMultipartUploads",
+            "s3:PutObject"
+        ],
+        "Resource": [
+            "arn:aws:s3:::data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}",
+            "arn:aws:s3:::data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}/*"
+        ]
+    }]
+}
+EOF
+        
+        aws iam put-role-policy --role-name "firehose-role-$ENVIRONMENT" --policy-name S3DeliveryPolicy --policy-document file:///tmp/firehose-policy.json
+    fi
+}
+
+create_firehose_streams() {
+    local bucket_name="data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}"
+    
+    if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name crm-stream-$ENVIRONMENT"; then
+        log_info "Creating CRM Firehose stream"
+        
+        cat > /tmp/crm-firehose-config.json << EOF
+{
+    "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
+    "BucketARN": "arn:aws:s3:::${bucket_name}",
+    "Prefix": "crm/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+    "ErrorOutputPrefix": "errors/crm/",
+    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
+    "CompressionFormat": "GZIP"
+}
+EOF
+        
+        aws firehose create-delivery-stream \
+            --delivery-stream-name "crm-stream-$ENVIRONMENT" \
+            --delivery-stream-type DirectPut \
+            --s3-destination-configuration file:///tmp/crm-firehose-config.json
+    fi
+    
+    if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name web-stream-$ENVIRONMENT"; then
+        log_info "Creating Web Firehose stream"
+        
+        cat > /tmp/web-firehose-config.json << EOF
+{
+    "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
+    "BucketARN": "arn:aws:s3:::${bucket_name}",
+    "Prefix": "web/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
+    "ErrorOutputPrefix": "errors/web/",
+    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
+    "CompressionFormat": "GZIP"
+}
+EOF
+        
+        aws firehose create-delivery-stream \
+            --delivery-stream-name "web-stream-$ENVIRONMENT" \
+            --delivery-stream-type DirectPut \
+            --s3-destination-configuration file:///tmp/web-firehose-config.json
+    fi
+    
+    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/crm-stream-name" --value "crm-stream-$ENVIRONMENT" --type String --overwrite
+    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/web-stream-name" --value "web-stream-$ENVIRONMENT" --type String --overwrite
+}
+
+create_ecs_cluster() {
+    local cluster_name="data-pipeline-cluster-$ENVIRONMENT"
+    
+    log_info "Checking for ECS cluster: $cluster_name"
+    
+    if aws ecs describe-clusters --clusters "$cluster_name" --query 'clusters[0].clusterName' --output text 2>/dev/null | grep -q "^$cluster_name$"; then
+        log_info "ECS cluster already exists: $cluster_name"
+    else
+        log_info "Creating ECS cluster: $cluster_name"
+        
+        if aws ecs create-cluster --cluster-name "$cluster_name" --capacity-providers FARGATE; then
+            log_info "ECS cluster creation initiated: $cluster_name"
+            
+            log_info "Waiting for cluster to become active..."
+            local max_attempts=30
+            local attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+                if aws ecs describe-clusters --clusters "$cluster_name" --query 'clusters[0].clusterName' --output text 2>/dev/null | grep -q "^$cluster_name$"; then
+                    log_info "ECS cluster is now active: $cluster_name"
+                    break
+                fi
+                
+                if [ $attempt -eq $max_attempts ]; then
+                    log_error "Cluster creation timeout after $max_attempts attempts"
+                    exit 1
+                fi
+                
+                log_info "Waiting for cluster... (attempt $attempt/$max_attempts)"
+                sleep 5
+                ((attempt++))
+            done
+        else
+            log_error "Failed to create ECS cluster: $cluster_name"
+            exit 1
+        fi
+    fi
+    
+    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/cluster-name" --value "$cluster_name" --type String --overwrite
+}
+
 create_security_group() {
     local sg_name="crm-producer-sg-$ENVIRONMENT"
     
     log_info "Checking for security group: $sg_name"
     
-    # Check if security group exists
     SG_ID=$(aws ec2 describe-security-groups \
         --filters "Name=group-name,Values=$sg_name" \
         --query 'SecurityGroups[0].GroupId' \
@@ -12,7 +214,6 @@ create_security_group() {
     if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
         log_info "Creating security group: $sg_name"
         
-        # Get default VPC
         VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=is-default,Values=true" \
             --query 'Vpcs[0].VpcId' \
@@ -23,7 +224,6 @@ create_security_group() {
             exit 1
         fi
         
-        # Create security group
         SG_ID=$(aws ec2 create-security-group \
             --group-name "$sg_name" \
             --description "Security group for data pipeline services" \
@@ -31,37 +231,31 @@ create_security_group() {
             --query 'GroupId' \
             --output text)
         
-        # Remove default outbound rule (all traffic)
         aws ec2 revoke-security-group-egress \
             --group-id $SG_ID \
             --protocol -1 \
             --cidr 0.0.0.0/0 2>/dev/null || true
         
-        # Configure specific outbound rules
         log_info "Configuring security group rules..."
         
-        # Allow outbound HTTPS (for AWS services like Firehose, ECR, S3)
         aws ec2 authorize-security-group-egress \
             --group-id $SG_ID \
             --protocol tcp \
             --port 443 \
             --cidr 0.0.0.0/0
         
-        # Allow outbound HTTP (for general web access)
         aws ec2 authorize-security-group-egress \
             --group-id $SG_ID \
             --protocol tcp \
             --port 80 \
             --cidr 0.0.0.0/0
         
-        # Allow outbound port 8000 (for your specific CRM API)
         aws ec2 authorize-security-group-egress \
             --group-id $SG_ID \
             --protocol tcp \
             --port 8000 \
             --cidr 0.0.0.0/0
         
-        # Allow outbound DNS (for domain resolution)
         aws ec2 authorize-security-group-egress \
             --group-id $SG_ID \
             --protocol udp \
@@ -73,7 +267,6 @@ create_security_group() {
         log_info "Security group already exists: $SG_ID"
     fi
     
-    # Store in Parameter Store
     aws ssm put-parameter \
         --name "/data-pipeline/$ENVIRONMENT/security-group-id" \
         --value "$SG_ID" \
@@ -81,7 +274,6 @@ create_security_group() {
         --overwrite
 }
 
-# CORRECT FUNCTION (PLURAL)
 create_log_groups() {
     log_info "Creating CloudWatch log groups"
     
@@ -96,7 +288,6 @@ create_log_groups() {
             log_info "Created log group: $log_group"
         fi
         
-        # Set retention policy
         aws logs put-retention-policy --log-group-name "$log_group" --retention-in-days 30
         log_info "Set retention policy for: $log_group"
     done
@@ -109,5 +300,5 @@ create_iam_roles
 create_firehose_streams
 create_ecs_cluster
 create_security_group
-create_log_groups  # ← This matches the function name above
+create_log_groups
 log_info "Infrastructure setup completed"
