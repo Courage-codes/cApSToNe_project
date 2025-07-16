@@ -9,6 +9,10 @@ log_info() {
     echo "$(date '+%H:%M:%S') [INFO] $1"
 }
 
+log_error() {
+    echo "$(date '+%H:%M:%S') [ERROR] $1" >&2
+}
+
 resource_exists() {
     local check_command="$1"
     eval "$check_command" &>/dev/null
@@ -169,9 +173,41 @@ EOF
 create_ecs_cluster() {
     local cluster_name="data-pipeline-cluster-$ENVIRONMENT"
     
-    if ! resource_exists "aws ecs describe-clusters --clusters $cluster_name"; then
-        log_info "Creating ECS cluster"
-        aws ecs create-cluster --cluster-name "$cluster_name" --capacity-providers FARGATE
+    log_info "Checking for ECS cluster: $cluster_name"
+    
+    # Fixed existence check that actually validates cluster exists
+    if aws ecs describe-clusters --clusters "$cluster_name" --query 'clusters[0].clusterName' --output text 2>/dev/null | grep -q "^$cluster_name$"; then
+        log_info "ECS cluster already exists: $cluster_name"
+    else
+        log_info "Creating ECS cluster: $cluster_name"
+        
+        if aws ecs create-cluster --cluster-name "$cluster_name" --capacity-providers FARGATE; then
+            log_info "ECS cluster creation initiated: $cluster_name"
+            
+            # Wait for cluster to be active
+            log_info "Waiting for cluster to become active..."
+            local max_attempts=30
+            local attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+                if aws ecs describe-clusters --clusters "$cluster_name" --query 'clusters[0].clusterName' --output text 2>/dev/null | grep -q "^$cluster_name$"; then
+                    log_info "ECS cluster is now active: $cluster_name"
+                    break
+                fi
+                
+                if [ $attempt -eq $max_attempts ]; then
+                    log_error "Cluster creation timeout after $max_attempts attempts"
+                    exit 1
+                fi
+                
+                log_info "Waiting for cluster... (attempt $attempt/$max_attempts)"
+                sleep 5
+                ((attempt++))
+            done
+        else
+            log_error "Failed to create ECS cluster: $cluster_name"
+            exit 1
+        fi
     fi
     
     aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/cluster-name" --value "$cluster_name" --type String --overwrite
