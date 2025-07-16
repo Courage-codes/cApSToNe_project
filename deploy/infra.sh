@@ -296,7 +296,7 @@ create_security_group() {
         --overwrite
 }
 
-create_log_group() {
+create_log_groups() {
     local log_group_name="/ecs/$SERVICE-$ENVIRONMENT"
     
     log_info "Creating CloudWatch log group: $log_group_name"
