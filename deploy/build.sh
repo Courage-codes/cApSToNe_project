@@ -60,7 +60,8 @@ deploy_service() {
         config/$SERVICE.json > /tmp/task-definition.json
     
     # Register task definition
-    aws ecs register-task-definition --family $task_family --cli-input-json file:///tmp/task-definition.json
+    TASK_DEF_ARN=$(aws ecs register-task-definition --family $task_family --cli-input-json file:///tmp/task-definition.json --query 'taskDefinition.taskDefinitionArn' --output text)
+    log_info "Registered task definition: $TASK_DEF_ARN"
     
     # Get VPC configuration
     VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
@@ -74,6 +75,7 @@ deploy_service() {
             --service $service_name \
             --task-definition $task_family \
             --desired-count 1 \
+            --force-new-deployment \
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}"
     else
         log_info "Creating new service"
@@ -86,8 +88,8 @@ deploy_service() {
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}"
     fi
     
-    # Wait for deployment
-    log_info "Waiting for deployment to complete"
+    # Wait for deployment with extended timeout
+    log_info "Waiting for deployment to complete (this may take up to 15 minutes)"
     aws ecs wait services-stable --cluster $cluster_name --services $service_name
     
     # Verify deployment success
