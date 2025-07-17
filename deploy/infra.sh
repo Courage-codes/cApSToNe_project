@@ -18,39 +18,8 @@ resource_exists() {
     eval "$check_command" &>/dev/null
 }
 
-create_s3_bucket() {
-    local bucket_name="data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}"
-    
-    if resource_exists "aws s3api head-bucket --bucket $bucket_name"; then
-        log_info "S3 bucket exists: $bucket_name"
-    else
-        log_info "Creating S3 bucket: $bucket_name in region: $REGION"
-        if [[ "$REGION" == "us-east-1" ]]; then
-            aws s3api create-bucket --bucket "$bucket_name" --region "$REGION"
-        else
-            aws s3api create-bucket \
-                --bucket "$bucket_name" \
-                --region "$REGION" \
-                --create-bucket-configuration LocationConstraint="$REGION"
-        fi
-        
-        log_info "Configuring bucket versioning and lifecycle"
-        aws s3api put-bucket-versioning --bucket "$bucket_name" --versioning-configuration Status=Enabled
-        
-        aws s3api put-bucket-lifecycle-configuration --bucket "$bucket_name" --lifecycle-configuration '{
-            "Rules": [{
-                "ID": "DeleteOldData",
-                "Status": "Enabled",
-                "Filter": {"Prefix": ""},
-                "Expiration": {"Days": 90}
-            }]
-        }'
-    fi
-    
-    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/bucket-name" --value "$bucket_name" --type String --overwrite
-}
-
 create_iam_roles() {
+    # ECS Execution Role
     if ! resource_exists "aws iam get-role --role-name ecs-execution-role-$ENVIRONMENT"; then
         log_info "Creating ECS execution role"
         aws iam create-role --role-name "ecs-execution-role-$ENVIRONMENT" --assume-role-policy-document '{
@@ -64,6 +33,7 @@ create_iam_roles() {
         aws iam attach-role-policy --role-name "ecs-execution-role-$ENVIRONMENT" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
     fi
     
+    # ECS Task Role with S3 and Firehose permissions for dual streaming
     if ! resource_exists "aws iam get-role --role-name ecs-task-role-$ENVIRONMENT"; then
         log_info "Creating ECS task role"
         aws iam create-role --role-name "ecs-task-role-$ENVIRONMENT" --assume-role-policy-document '{
@@ -74,90 +44,47 @@ create_iam_roles() {
                 "Action": "sts:AssumeRole"
             }]
         }'
-        aws iam attach-role-policy --role-name "ecs-task-role-$ENVIRONMENT" --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
-    fi
-    
-    if ! resource_exists "aws iam get-role --role-name firehose-role-$ENVIRONMENT"; then
-        log_info "Creating Firehose role"
-        aws iam create-role --role-name "firehose-role-$ENVIRONMENT" --assume-role-policy-document '{
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "firehose.amazonaws.com"},
-                "Action": "sts:AssumeRole"
-            }]
-        }'
         
-        cat > /tmp/firehose-policy.json << EOF
+        # S3 permissions for direct writes
+        cat > /tmp/ecs-task-s3-policy.json << EOF
 {
     "Version": "2012-10-17",
-    "Statement": [{
-        "Effect": "Allow",
-        "Action": [
-            "s3:AbortMultipartUpload",
-            "s3:GetBucketLocation",
-            "s3:GetObject",
-            "s3:ListBucket",
-            "s3:ListBucketMultipartUploads",
-            "s3:PutObject"
-        ],
-        "Resource": [
-            "arn:aws:s3:::data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}",
-            "arn:aws:s3:::data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}/*"
-        ]
-    }]
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:PutObjectAcl"
+            ],
+            "Resource": [
+                "arn:aws:s3:::*/*"
+            ]
+        }
+    ]
 }
 EOF
+        aws iam put-role-policy --role-name "ecs-task-role-$ENVIRONMENT" --policy-name "S3WriteAccess" --policy-document file:///tmp/ecs-task-s3-policy.json
         
-        aws iam put-role-policy --role-name "firehose-role-$ENVIRONMENT" --policy-name S3DeliveryPolicy --policy-document file:///tmp/firehose-policy.json
-    fi
-}
-
-create_firehose_streams() {
-    local bucket_name="data-pipeline-${ENVIRONMENT}-${ACCOUNT_ID}"
-    
-    if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name crm-stream-$ENVIRONMENT"; then
-        log_info "Creating CRM Firehose stream"
-        
-        cat > /tmp/crm-firehose-config.json << EOF
+        # Firehose permissions
+        cat > /tmp/ecs-task-firehose-policy.json << EOF
 {
-    "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
-    "BucketARN": "arn:aws:s3:::${bucket_name}",
-    "Prefix": "crm/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
-    "ErrorOutputPrefix": "errors/crm/",
-    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
-    "CompressionFormat": "GZIP"
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "firehose:PutRecord",
+                "firehose:PutRecordBatch"
+            ],
+            "Resource": [
+                "arn:aws:firehose:${REGION}:${ACCOUNT_ID}:deliverystream/*"
+            ]
+        }
+    ]
 }
 EOF
-        
-        aws firehose create-delivery-stream \
-            --delivery-stream-name "crm-stream-$ENVIRONMENT" \
-            --delivery-stream-type DirectPut \
-            --s3-destination-configuration file:///tmp/crm-firehose-config.json
+        aws iam put-role-policy --role-name "ecs-task-role-$ENVIRONMENT" --policy-name "FirehoseAccess" --policy-document file:///tmp/ecs-task-firehose-policy.json
     fi
-    
-    if ! resource_exists "aws firehose describe-delivery-stream --delivery-stream-name web-stream-$ENVIRONMENT"; then
-        log_info "Creating Web Firehose stream"
-        
-        cat > /tmp/web-firehose-config.json << EOF
-{
-    "RoleARN": "arn:aws:iam::${ACCOUNT_ID}:role/firehose-role-${ENVIRONMENT}",
-    "BucketARN": "arn:aws:s3:::${bucket_name}",
-    "Prefix": "web/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
-    "ErrorOutputPrefix": "errors/web/",
-    "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 60},
-    "CompressionFormat": "GZIP"
-}
-EOF
-        
-        aws firehose create-delivery-stream \
-            --delivery-stream-name "web-stream-$ENVIRONMENT" \
-            --delivery-stream-type DirectPut \
-            --s3-destination-configuration file:///tmp/web-firehose-config.json
-    fi
-    
-    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/crm-stream-name" --value "crm-stream-$ENVIRONMENT" --type String --overwrite
-    aws ssm put-parameter --name "/data-pipeline/$ENVIRONMENT/web-stream-name" --value "web-stream-$ENVIRONMENT" --type String --overwrite
 }
 
 create_ecs_cluster() {
@@ -279,25 +206,19 @@ create_log_groups() {
     
     for service in crm web; do
         local log_group="/ecs/$service-$ENVIRONMENT"
-        
-        if aws logs describe-log-groups --log-group-name-prefix "$log_group" --query "logGroups[?logGroupName=='$log_group']" --output text | grep -q .; then
-            log_info "Log group already exists: $log_group"
-        else
+        if ! aws logs describe-log-groups --log-group-name-prefix "$log_group" --query "logGroups[?logGroupName=='$log_group']" --output text | grep -q "$log_group"; then
             log_info "Creating log group: $log_group"
             aws logs create-log-group --log-group-name "$log_group"
-            log_info "Created log group: $log_group"
+            aws logs put-retention-policy --log-group-name "$log_group" --retention-in-days 7
+        else
+            log_info "Log group already exists: $log_group"
         fi
-        
-        aws logs put-retention-policy --log-group-name "$log_group" --retention-in-days 30
-        log_info "Set retention policy for: $log_group"
     done
 }
 
 # Main execution
 log_info "Setting up infrastructure for environment: $ENVIRONMENT"
-create_s3_bucket
 create_iam_roles
-create_firehose_streams
 create_ecs_cluster
 create_security_group
 create_log_groups

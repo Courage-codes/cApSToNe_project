@@ -23,8 +23,12 @@
           "value": "http://3.248.199.26:8000/api/web-traffic/"
         },
         {
-          "name": "STREAM_NAME",
-          "value": "web-stream-{environment}"
+          "name": "FIREHOSE_STREAM_NAME",
+          "value": "web_traffic_logs"
+        },
+        {
+          "name": "S3_BUCKET_NAME",
+          "value": "data-pipeline-{environment}-{account}"
         },
         {
           "name": "POLL_INTERVAL",
@@ -51,7 +55,7 @@
         "interval": 30,
         "timeout": 10,
         "retries": 3,
-        "startPeriod": 60
+        "startPeriod": 180
       }
     }
   ]

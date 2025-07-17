@@ -3,18 +3,18 @@
   "environments": {
     "dev": {
       "cluster": "data-pipeline-cluster-dev",
-      "bucket": "data-pipeline-dev",
+      "bucket": "data-pipeline-dev-605134436600",
       "streams": {
-        "crm": "crm-stream-dev",
-        "web": "web-stream-dev"
+        "crm": "PUT-S3-SrBTP",
+        "web": "web_traffic_logs"
       }
     },
     "prod": {
       "cluster": "data-pipeline-cluster-prod",
-      "bucket": "data-pipeline-prod",
+      "bucket": "data-pipeline-prod-605134436600",
       "streams": {
-        "crm": "crm-stream-prod",
-        "web": "web-stream-prod"
+        "crm": "PUT-S3-SrBTP-prod",
+        "web": "web_traffic_logs-prod"
       }
     }
   }

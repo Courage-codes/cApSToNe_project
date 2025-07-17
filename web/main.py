@@ -42,10 +42,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 class WebProducer:
     def __init__(self):
         self.api_url = os.getenv('API_URL', 'http://3.248.199.26:8000/api/web-traffic/')
-        self.stream_name = os.getenv('STREAM_NAME', 'web-stream-dev')
+        self.stream_name = os.getenv('FIREHOSE_STREAM_NAME', 'web_traffic_logs')
+        self.s3_bucket = os.getenv('S3_BUCKET_NAME', 'data-pipeline-dev-605134436600')
         self.poll_interval = int(os.getenv('POLL_INTERVAL', '30'))
         self.region = os.getenv('AWS_DEFAULT_REGION', 'eu-west-1')
         
+        # Initialize AWS clients
         try:
             self.firehose = boto3.client('firehose', region_name=self.region)
             logger.info(f"Successfully initialized Firehose client for region: {self.region}")
@@ -53,7 +55,14 @@ class WebProducer:
             logger.error(f"Failed to initialize Firehose client: {e}")
             raise
         
-        logger.info(f"Web Producer initialized - Stream: {self.stream_name}, API: {self.api_url}")
+        try:
+            self.s3 = boto3.client('s3', region_name=self.region)
+            logger.info(f"Successfully initialized S3 client for region: {self.region}")
+        except Exception as e:
+            logger.error(f"Failed to initialize S3 client: {e}")
+            raise
+        
+        logger.info(f"Web Producer initialized - Stream: {self.stream_name}, S3 Bucket: {self.s3_bucket}, API: {self.api_url}")
 
     def start_health_server(self):
         """Start health check server on port 8080"""
@@ -88,25 +97,24 @@ class WebProducer:
             
             # Parse JSON response
             json_response = response.json()
-            logger.info(f"Raw API response type: {type(json_response)}")
             
             # Check if API returned an error
             if isinstance(json_response, dict) and 'error' in json_response:
                 logger.warning(f"API returned error: {json_response['error']}")
                 return None
             
-            # CRITICAL FIX: Normalize response to list format
-            if isinstance(json_response, dict):
+            # Handle different response formats
+            if isinstance(json_response, list):
+                # Response is already a list
+                data = json_response
+            elif isinstance(json_response, dict):
                 # Single record response - wrap in list
                 data = [json_response]
-                logger.info(f"Successfully fetched 1 record from Web API (wrapped single object)")
-            elif isinstance(json_response, list):
-                # Array response - use as-is
-                data = json_response
-                logger.info(f"Successfully fetched {len(data)} records from Web API")
             else:
                 logger.error(f"Unexpected response format: {type(json_response)}")
                 return None
+            
+            logger.info(f"Successfully fetched {len(data)} records from Web API")
             
             # Log sample record for debugging
             if data and len(data) > 0:
@@ -125,87 +133,68 @@ class WebProducer:
             logger.error(f"Unexpected error fetching data: {e}")
             return None
 
-    def is_valid_record(self, record: Dict) -> bool:
-        """Check if a record is valid web traffic data"""
+    def send_to_s3(self, records: List[Dict]) -> bool:
+        """Send raw records directly to S3 with no enrichment"""
         try:
-            if not isinstance(record, dict):
-                return False
+            if not records:
+                logger.info("No records to send to S3")
+                return True
             
-            # Check if record has expected web traffic fields
-            required_fields = ['session_id', 'page', 'device_type', 'browser', 'event_type', 'timestamp']
+            # Create S3 key with date partitioning
+            current_date = datetime.utcnow().strftime('%Y-%m-%d')
+            timestamp = int(time.time() * 1000)
+            s3_key = f"direct/web/{current_date}/batch_{timestamp}.json"
             
-            # Must have at least 4 of these fields
-            has_fields = sum(1 for field in required_fields if field in record)
+            # Send raw API data without any enrichment
+            data_content = '\n'.join([json.dumps(record) for record in records])
             
-            if has_fields >= 4:
-                # Additional validation: check if values are reasonable
-                # user_id can be None, so we don't require it
-                if 'timestamp' in record and record['timestamp'] is not None:
-                    return True
+            logger.info(f"Sending {len(records)} raw records to S3: s3://{self.s3_bucket}/{s3_key}")
             
-            return False
+            # Upload to S3
+            self.s3.put_object(
+                Bucket=self.s3_bucket,
+                Key=s3_key,
+                Body=data_content,
+                ContentType='application/json'
+            )
+            
+            logger.info(f"Successfully sent {len(records)} raw records to S3")
+            return True
+            
         except Exception as e:
-            logger.error(f"Error validating record: {e}")
+            logger.error(f"S3 send failed: {e}")
             return False
-
-    def process_record(self, record: Dict) -> Dict:
-        """Process and enrich a single record"""
-        try:
-            # Ensure record is a dictionary
-            if not isinstance(record, dict):
-                logger.warning(f"Invalid record type: {type(record)}, converting to dict")
-                record = {"raw_data": str(record)}
-            
-            # Skip error records
-            if 'error' in record:
-                logger.debug(f"Skipping error record: {record}")
-                return None
-            
-            # Validate record
-            if not self.is_valid_record(record):
-                logger.debug(f"Skipping invalid record: {record}")
-                return None
-            
-            # Enrich the record
-            enriched_record = {
-                **record,
-                'processed_at': datetime.utcnow().isoformat(),
-                'source': 'web-api',
-                'pipeline': 'web-processor',
-                'region': self.region
-            }
-            
-            return enriched_record
-        except Exception as e:
-            logger.error(f"Error processing record: {e}")
-            return None
 
     def send_to_firehose(self, records: List[Dict]) -> bool:
-        """Send records to Kinesis Firehose"""
+        """Send raw records to Kinesis Firehose with no enrichment"""
         try:
             if not records:
                 logger.info("No records to send to Firehose")
                 return True
             
-            # Process each record and create Firehose records
+            # Create Firehose records with raw API data (no enrichment)
             firehose_records = []
             for record in records:
                 try:
-                    processed_record = self.process_record(record)
-                    if processed_record is not None:  # Skip None records (invalid/errors)
-                        firehose_record = {
-                            'Data': json.dumps(processed_record) + '\n'
-                        }
-                        firehose_records.append(firehose_record)
+                    # Skip error records
+                    if isinstance(record, dict) and 'error' in record:
+                        logger.debug(f"Skipping error record: {record}")
+                        continue
+                    
+                    # Send raw record without any enrichment
+                    firehose_record = {
+                        'Data': json.dumps(record) + '\n'
+                    }
+                    firehose_records.append(firehose_record)
                 except Exception as e:
-                    logger.error(f"Error processing individual record: {e}")
+                    logger.error(f"Error preparing record for Firehose: {e}")
                     continue
             
             if not firehose_records:
-                logger.info("No valid records to send to Firehose after processing")
-                return True  # Return True since this isn't an error
+                logger.info("No valid records to send to Firehose after filtering")
+                return True
             
-            logger.info(f"Sending {len(firehose_records)} records to Firehose stream: {self.stream_name}")
+            logger.info(f"Sending {len(firehose_records)} raw records to Firehose stream: {self.stream_name}")
             
             response = self.firehose.put_record_batch(
                 DeliveryStreamName=self.stream_name,
@@ -221,23 +210,43 @@ class WebProducer:
                         logger.error(f"Record {i} failed: {record_result}")
                 return False
             
-            logger.info(f"Successfully sent {len(firehose_records)} records to Firehose")
+            logger.info(f"Successfully sent {len(firehose_records)} raw records to Firehose")
             return True
             
         except Exception as e:
             logger.error(f"Firehose send failed: {e}")
             return False
 
+    def send_to_both_destinations(self, records: List[Dict]) -> tuple:
+        """Send raw data to both S3 and Firehose simultaneously"""
+        s3_success = self.send_to_s3(records)
+        firehose_success = self.send_to_firehose(records)
+        
+        return s3_success, firehose_success
+
     def run_cycle(self):
-        """Run one polling cycle"""
+        """Run one polling cycle with dual streaming of raw data"""
         try:
             data = self.fetch_data()
             if data:
-                success = self.send_to_firehose(data)
-                if success:
+                logger.info(f"Sending {len(data)} raw records to both S3 and Firehose")
+                
+                # Send raw data to both destinations
+                s3_success, firehose_success = self.send_to_both_destinations(data)
+                
+                # Log results
+                if s3_success and firehose_success:
+                    logger.info("✅ Successfully sent raw data to both S3 and Firehose")
                     logger.info("Polling cycle completed successfully")
+                elif s3_success:
+                    logger.warning("⚠️ S3 succeeded, Firehose failed")
+                    logger.error("Polling cycle partially failed")
+                elif firehose_success:
+                    logger.warning("⚠️ Firehose succeeded, S3 failed")
+                    logger.error("Polling cycle partially failed")
                 else:
-                    logger.error("Polling cycle failed during Firehose send")
+                    logger.error("❌ Both S3 and Firehose failed")
+                    logger.error("Polling cycle failed completely")
             else:
                 logger.info("No data available in this polling cycle")
         except Exception as e:
@@ -245,7 +254,7 @@ class WebProducer:
 
     def run(self):
         """Main run loop"""
-        logger.info("Starting Web Producer")
+        logger.info("Starting Web Producer with dual streaming (S3 + Firehose) - NO DATA ENRICHMENT")
         
         try:
             health_server = self.start_health_server()

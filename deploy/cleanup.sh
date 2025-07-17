@@ -28,17 +28,6 @@ cleanup_services() {
         aws ecs delete-cluster --cluster $cluster_name
     fi
 }
-
-cleanup_firehose() {
-    for stream in crm-stream web-stream; do
-        local stream_name="$stream-$ENVIRONMENT"
-        if aws firehose describe-delivery-stream --delivery-stream-name $stream_name 2>/dev/null; then
-            log_info "Deleting Firehose stream: $stream_name"
-            aws firehose delete-delivery-stream --delivery-stream-name $stream_name
-        fi
-    done
-}
-
 cleanup_iam() {
     for role in ecs-execution-role ecs-task-role firehose-role; do
         local role_name="$role-$ENVIRONMENT"
@@ -92,7 +81,6 @@ cleanup_parameters() {
 # Main execution
 log_info "Starting cleanup for environment: $ENVIRONMENT"
 cleanup_services
-cleanup_firehose
 cleanup_iam
 cleanup_logs
 cleanup_s3

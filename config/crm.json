@@ -23,8 +23,12 @@
           "value": "http://3.248.199.26:8000/api/customer-interaction/"
         },
         {
-          "name": "STREAM_NAME",
-          "value": "crm-stream-{environment}"
+          "name": "FIREHOSE_STREAM_NAME",
+          "value": "PUT-S3-SrBTP"
+        },
+        {
+          "name": "S3_BUCKET_NAME",
+          "value": "data-pipeline-{environment}-{account}"
         },
         {
           "name": "POLL_INTERVAL",
